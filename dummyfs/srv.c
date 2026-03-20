@@ -32,10 +32,16 @@
 #define LOG(msg, ...) printf("dummyfs: " msg, ##__VA_ARGS__)
 
 
-static void dummyfs_trace(int enabled, const char *msg)
+enum { traceNone = 0, traceRoot, traceDevfs };
+
+
+static void dummyfs_trace(int traceKind, const char *rootMsg, const char *devfsMsg)
 {
-	if (enabled != 0) {
-		debug(msg);
+	if (traceKind == traceRoot) {
+		debug(rootMsg);
+	}
+	else if (traceKind == traceDevfs) {
+		debug(devfsMsg);
 	}
 }
 
@@ -159,6 +165,7 @@ int main(int argc, char **argv)
 	const char *remount_path = NULL;
 	int non_fs_namespace = 0;
 	int daemonize = 0;
+	int traceKind = traceNone;
 	int lookupTrace = 0;
 	int c;
 
@@ -226,6 +233,7 @@ int main(int argc, char **argv)
 	}
 
 	if (mountpt == NULL) {
+		traceKind = traceRoot;
 
 		while (write(1, "", 0) < 0) {
 			usleep(500000);
@@ -241,6 +249,7 @@ int main(int argc, char **argv)
 	}
 	else {
 		if (non_fs_namespace) {
+			traceKind = traceDevfs;
 			while (write(1, "", 0) < 0)
 				usleep(1000);
 			portCreate(&port);
@@ -248,7 +257,7 @@ int main(int argc, char **argv)
 				LOG("can't mount as %s\n", mountpt);
 				return -1;
 			}
-			dummyfs_trace(non_fs_namespace, "dummyfs: nonfs registered\n");
+			dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
 			mountpt = NULL;
 		}
 		else {
@@ -290,14 +299,15 @@ int main(int argc, char **argv)
 	/*** MAIN LOOP ***/
 
 	LOG("initialized\n");
-	dummyfs_trace(non_fs_namespace, "dummyfs: initialized\n");
+	dummyfs_trace(traceKind, "dummyfs: root initialized\n", "dummyfs: devfs initialized\n");
 
 	for (;;) {
 		if (msgRecv(ctx->port, &msg, &rid) < 0)
 			continue;
 
-		if ((non_fs_namespace != 0) && (lookupTrace == 0) && (msg.type == mtLookup)) {
-			debug("dummyfs: lookup recv\n");
+		if ((traceKind == traceRoot) && (lookupTrace == 0) && (msg.type == mtLookup) && (msg.i.data != NULL) &&
+			(strcmp(msg.i.data, "devfs") == 0)) {
+			debug("dummyfs: root lookup recv\n");
 		}
 
 		switch (msg.type) {
@@ -355,8 +365,9 @@ int main(int argc, char **argv)
 
 			case mtLookup:
 				msg.o.err = dummyfs_lookup(ctx, &msg.oid, msg.i.data, &msg.o.lookup.fil, &msg.o.lookup.dev);
-				if ((non_fs_namespace != 0) && (lookupTrace == 0)) {
-					debug("dummyfs: lookup rsp\n");
+				if ((traceKind == traceRoot) && (lookupTrace == 0) && (msg.i.data != NULL) &&
+					(strcmp(msg.i.data, "devfs") == 0)) {
+					debug("dummyfs: root lookup rsp\n");
 					lookupTrace = 1;
 				}
 				break;
