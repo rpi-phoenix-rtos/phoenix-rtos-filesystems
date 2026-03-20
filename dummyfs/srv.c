@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/debug.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
@@ -29,6 +30,14 @@
 #include "dir.h"
 
 #define LOG(msg, ...) printf("dummyfs: " msg, ##__VA_ARGS__)
+
+
+static void dummyfs_trace(int enabled, const char *msg)
+{
+	if (enabled != 0) {
+		debug(msg);
+	}
+}
 
 int fetch_modules(dummyfs_t *ctx)
 {
@@ -150,6 +159,7 @@ int main(int argc, char **argv)
 	const char *remount_path = NULL;
 	int non_fs_namespace = 0;
 	int daemonize = 0;
+	int lookupTrace = 0;
 	int c;
 
 
@@ -238,6 +248,7 @@ int main(int argc, char **argv)
 				LOG("can't mount as %s\n", mountpt);
 				return -1;
 			}
+			dummyfs_trace(non_fs_namespace, "dummyfs: nonfs registered\n");
 			mountpt = NULL;
 		}
 		else {
@@ -279,10 +290,15 @@ int main(int argc, char **argv)
 	/*** MAIN LOOP ***/
 
 	LOG("initialized\n");
+	dummyfs_trace(non_fs_namespace, "dummyfs: initialized\n");
 
 	for (;;) {
 		if (msgRecv(ctx->port, &msg, &rid) < 0)
 			continue;
+
+		if ((non_fs_namespace != 0) && (lookupTrace == 0) && (msg.type == mtLookup)) {
+			debug("dummyfs: lookup recv\n");
+		}
 
 		switch (msg.type) {
 
@@ -339,6 +355,10 @@ int main(int argc, char **argv)
 
 			case mtLookup:
 				msg.o.err = dummyfs_lookup(ctx, &msg.oid, msg.i.data, &msg.o.lookup.fil, &msg.o.lookup.dev);
+				if ((non_fs_namespace != 0) && (lookupTrace == 0)) {
+					debug("dummyfs: lookup rsp\n");
+					lookupTrace = 1;
+				}
 				break;
 
 			case mtLink:
