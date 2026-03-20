@@ -1,0 +1,9 @@
+#
+# Makefile for Phoenix-RTOS 3 filesystems
+#
+# Generic AArch64 filesystems
+#
+# Copyright 2026 Phoenix Systems
+#
+
+DEFAULT_COMPONENTS := dummyfs libext2 libjffs2
