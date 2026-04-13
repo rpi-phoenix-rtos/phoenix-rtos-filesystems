@@ -23,11 +23,63 @@
 #include <unistd.h>
 
 #include <phoenix/sysinfo.h>
+#include <sys/mman.h>
+#include <sys/platform.h>
 
 #include "dummyfs_internal.h"
 #include "dummyfs.h"
 #include "object.h"
 #include "dir.h"
+
+#if defined(__CPU_GENERIC)
+#include <phoenix/arch/aarch64/generic/generic.h>
+
+static struct {
+        void *fbaddr;
+        uint32_t fbmemsz;
+        uint16_t fbpitch;
+        uint16_t fbrows;
+        uint16_t fbcols;
+        uint16_t fbrow;
+        uint16_t fbcol;
+} dummyfs_fbcon;
+
+
+static void dummyfs_fbcon_write(const char *s)
+{
+        platformctl_t pctl = { .action = pctl_get, .type = pctl_graphmode };
+        size_t i, len;
+        unsigned char c;
+
+        if (dummyfs_fbcon.fbaddr == NULL) {
+                if (platformctl(&pctl) < 0 || pctl.task.graphmode.framebuffer == 0) return;
+                dummyfs_fbcon.fbmemsz = (pctl.task.graphmode.pitch * pctl.task.graphmode.height + 0xfff) & ~0xfff;
+                dummyfs_fbcon.fbaddr = mmap(NULL, dummyfs_fbcon.fbmemsz, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, pctl.task.graphmode.framebuffer);
+                if (dummyfs_fbcon.fbaddr == MAP_FAILED) { dummyfs_fbcon.fbaddr = NULL; return; }
+                dummyfs_fbcon.fbpitch = pctl.task.graphmode.pitch;
+                dummyfs_fbcon.fbrows = pctl.task.graphmode.height / 16;
+                dummyfs_fbcon.fbcols = pctl.task.graphmode.width / 8;
+                dummyfs_fbcon.fbrow = 10; /* Start below pl011-tty */
+        }
+
+        len = strlen(s);
+        for (i = 0; i < len; ++i) {
+                c = s[i];
+                if (c == '\n') { dummyfs_fbcon.fbcol = 0; dummyfs_fbcon.fbrow++; }
+                else {
+                        uint32_t *pix = (uint32_t *)((char *)dummyfs_fbcon.fbaddr + dummyfs_fbcon.fbrow * 16 * dummyfs_fbcon.fbpitch + dummyfs_fbcon.fbcol * 8 * 4);
+                        for (int y = 0; y < 14; ++y) {
+                                for (int x = 0; x < 6; ++x) pix[x] = 0xffffffff;
+                                pix = (uint32_t *)((char *)pix + dummyfs_fbcon.fbpitch);
+                        }
+                        dummyfs_fbcon.fbcol++;
+                }
+        }
+}
+#else
+#define dummyfs_fbcon_write(s) do {} while (0)
+#endif
+
 
 #define LOG(msg, ...) printf("dummyfs: " msg, ##__VA_ARGS__)
 
@@ -171,125 +223,140 @@ int main(int argc, char **argv)
 
 
 	while ((c = getopt(argc, argv, "Dhm:r:N:")) != -1) {
-		switch (c) {
-			case 'm':
-				mountpt = optarg;
-				break;
-			case 'r':
-				remount_path = optarg;
-				break;
-			case 'h':
-				print_usage(argv[0]);
-				return 0;
-			case 'D':
-				daemonize = 1;
-				break;
-			case 'N':
-				non_fs_namespace = 1;
-				mountpt = optarg;
-				break;
-			default:
-				print_usage(argv[0]);
-				return 1;
-		}
+	        switch (c) {
+	                case 'm':
+	                        mountpt = optarg;
+	                        break;
+	                case 'r':
+	                        remount_path = optarg;
+	                        break;
+	                case 'h':
+	                        print_usage(argv[0]);
+	                        return 0;
+	                case 'D':
+	                        daemonize = 1;
+	                        break;
+	                case 'N':
+	                        non_fs_namespace = 1;
+	                        mountpt = optarg;
+	                        break;
+	                default:
+	                        print_usage(argv[0]);
+	                        return 1;
+	        }
+	}
+
+	dummyfs_fbcon_write("dummyfs: started\n");
+	if (mountpt) {
+	        dummyfs_fbcon_write("dummyfs: mountpt=");
+	        dummyfs_fbcon_write(mountpt);
+	        dummyfs_fbcon_write("\n");
 	}
 
 	if (daemonize && !mountpt) {
-		LOG("can't daemonize without mountpoint, exiting!\n");
-		return 1;
+	        LOG("can't daemonize without mountpoint, exiting!\n");
+	        return 1;
 	}
 
 
 	/* Daemonizing first to make all initialization in child process.
 	 * Otherwise the port will be destroyed when parent exits. */
 	if (daemonize) {
-		pid_t pid, sid;
+	        pid_t pid, sid;
 
-		/* set exit handler */
-		signal(SIGUSR1, signal_exit);
-		/* Fork off the parent process */
-		pid = fork();
-		if (pid < 0) {
-			LOG("fork failed: [%d] -> %s\n", errno, strerror(errno));
-			exit(EXIT_FAILURE);
-		}
+	        dummyfs_fbcon_write("dummyfs: daemonizing\n");
+	        /* set exit handler */
+	        signal(SIGUSR1, signal_exit);
+	        /* Fork off the parent process */
+	        pid = fork();
+	        if (pid < 0) {
+	                LOG("fork failed: [%d] -> %s\n", errno, strerror(errno));
+	                exit(EXIT_FAILURE);
+	        }
 
-		if (pid > 0) {
-			/* PARENT: wait for initialization to finish and then exit */
-			sleep(10);
+	        if (pid > 0) {
+	                dummyfs_fbcon_write("dummyfs: parent waiting\n");
+	                /* PARENT: wait for initialization to finish and then exit */
+	                sleep(10);
 
-			LOG("failed to communicate with child\n");
-			exit(EXIT_FAILURE);
-		}
-		/* set default handler back again */
-		signal(SIGUSR1, signal_exit);
+	                LOG("failed to communicate with child\n");
+	                dummyfs_fbcon_write("dummyfs: parent timeout\n");
+	                exit(EXIT_FAILURE);
+	        }
+	        dummyfs_fbcon_write("dummyfs: child sid\n");
+	        /* set default handler back again */
+	        signal(SIGUSR1, signal_exit);
 
-		/* Create a new SID for the child process */
-		sid = setsid();
-		if (sid < 0) {
-			LOG("setsid failed: [%d] -> %s\n", errno, strerror(errno));
-			exit(EXIT_FAILURE);
-		}
+	        /* Create a new SID for the child process */
+	        sid = setsid();
+	        if (sid < 0) {
+	                LOG("setsid failed: [%d] -> %s\n", errno, strerror(errno));
+	                exit(EXIT_FAILURE);
+	        }
 	}
 
 	if (mountpt == NULL) {
-		traceKind = traceRoot;
+	        dummyfs_fbcon_write("dummyfs: root init\n");
+	        traceKind = traceRoot;
 
-		while (write(1, "", 0) < 0) {
-			usleep(500000);
-		}
+	        while (write(1, "", 0) < 0) {
+	                usleep(500000);
+	        }
 
-		portCreate(&port);
+	        portCreate(&port);
 
-		/* Try to mount fs as root */
-		if (portRegister(port, "/", &root) < 0) {
-			LOG("can't mount as rootfs\n");
-			return -1;
-		}
+	        /* Try to mount fs as root */
+	        if (portRegister(port, "/", &root) < 0) {
+	                LOG("can't mount as rootfs\n");
+	                return -1;
+	        }
 	}
 	else {
-		if (non_fs_namespace) {
-			traceKind = traceDevfs;
-			while (write(1, "", 0) < 0)
-				usleep(1000);
-			portCreate(&port);
-			if (portRegister(port, mountpt, &root) < 0) {
-				LOG("can't mount as %s\n", mountpt);
-				return -1;
-			}
-			dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
-			mountpt = NULL;
-		}
-		else {
-			portCreate(&port);
-		}
+	        if (non_fs_namespace) {
+	                dummyfs_fbcon_write("dummyfs: devfs reg\n");
+	                traceKind = traceDevfs;
+	                while (write(1, "", 0) < 0)
+	                        usleep(1000);
+	                portCreate(&port);
+	                if (portRegister(port, mountpt, &root) < 0) {
+	                        LOG("can't mount as %s\n", mountpt);
+	                        return -1;
+	                }
+	                dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
+	                mountpt = NULL;
+	        }
+	        else {
+	                dummyfs_fbcon_write("dummyfs: mount reg\n");
+	                portCreate(&port);
+	        }
 	}
 
 	root.port = port;
 	if (dummyfs_mount((void **)&ctx, mountpt, 0, &root) != EOK) {
-		printf("dummyfs mount failed\n");
-		return 1;
+	        printf("dummyfs mount failed\n");
+	        return 1;
 	}
 
 	if (!non_fs_namespace && mountpt == NULL) {
-		if (fetch_modules(ctx) != EOK) {
-			printf("dummyfs: fetch_modules failed\n");
-			return 1;
-		}
-		mountpt = remount_path;
+	        dummyfs_fbcon_write("dummyfs: fetch modules\n");
+	        if (fetch_modules(ctx) != EOK) {
+	                printf("dummyfs: fetch_modules failed\n");
+	                return 1;
+	        }
+	        mountpt = remount_path;
 	}
 
 	if (daemonize) {
-		/* mount synchronously */
-		if (!non_fs_namespace && dummyfs_mount_sync(ctx, mountpt)) {
-			LOG("failed to mount, exiting\n");
-			return 1;
-		}
+	        dummyfs_fbcon_write("dummyfs: child init ok\n");
+	        /* mount synchronously */
+	        if (!non_fs_namespace && dummyfs_mount_sync(ctx, mountpt)) {
+	                LOG("failed to mount, exiting\n");
+	                return 1;
+	        }
 
-		/* init completed - wake parent */
-		kill(getppid(), SIGUSR1);
-	}
-	else if (mountpt != NULL) {
+	        /* init completed - wake parent */
+	        kill(getppid(), SIGUSR1);
+	}	else if (mountpt != NULL) {
 		ctx->mountpt = strdup(mountpt);
 		if (ctx->mountpt == NULL)
 			return 1;
