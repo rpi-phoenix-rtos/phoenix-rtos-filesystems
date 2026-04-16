@@ -232,38 +232,45 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (mountpt == NULL) {
-		traceKind = traceRoot;
+        if (mountpt == NULL) {
+                traceKind = traceRoot;
 
-		while (write(1, "", 0) < 0) {
-			usleep(500000);
-		}
+                portCreate(&port);
 
-		portCreate(&port);
+                /* Try to mount fs as root */
+                if (portRegister(port, "/", &root) < 0) {
+                        LOG("can't mount as rootfs\n");
+                        return -1;
+                }
+        }
+        else {
+                if (non_fs_namespace) {
+                        traceKind = traceDevfs;
+                        portCreate(&port);
+                        if (portRegister(port, mountpt, &root) < 0) {
+                                LOG("can't mount as %s\n", mountpt);
+                                return -1;
+                        }
+                        dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
 
-		/* Try to mount fs as root */
-		if (portRegister(port, "/", &root) < 0) {
-			LOG("can't mount as rootfs\n");
-			return -1;
-		}
-	}
-	else {
-		if (non_fs_namespace) {
-			traceKind = traceDevfs;
-			while (write(1, "", 0) < 0)
-				usleep(1000);
-			portCreate(&port);
-			if (portRegister(port, mountpt, &root) < 0) {
-				LOG("can't mount as %s\n", mountpt);
-				return -1;
-			}
-			dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
-			mountpt = NULL;
-		}
-		else {
-			portCreate(&port);
-		}
-	}
+                        /* Signal Stage 5: devfs registered */
+                        void *gpio = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, 0xfe200000u);
+                        if (gpio != MAP_FAILED) {
+                                volatile uint32_t *gpioregs = (volatile uint32_t *)gpio;
+                                gpioregs[4] = (gpioregs[4] & ~(7u << 6)) | (1u << 6);
+                                for (int i = 0; i < 5; ++i) {
+                                        gpioregs[8] = (1u << 10); usleep(100000);
+                                        gpioregs[11] = (1u << 10); usleep(100000);
+                                }
+                                munmap(gpio, 4096);
+                        }
+
+                        mountpt = NULL;
+                }
+                else {
+                        portCreate(&port);
+                }
+        }
 
 	root.port = port;
 	if (dummyfs_mount((void **)&ctx, mountpt, 0, &root) != EOK) {
