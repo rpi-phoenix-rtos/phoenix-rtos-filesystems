@@ -247,26 +247,14 @@ int main(int argc, char **argv)
                 if (non_fs_namespace) {
                         traceKind = traceDevfs;
                         portCreate(&port);
-                        if (portRegister(port, mountpt, &root) < 0) {
-                                LOG("can't mount as %s\n", mountpt);
-                                return -1;
-                        }
-                        dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
+			if (portRegister(port, mountpt, &root) < 0) {
+				LOG("can't mount as %s\n", mountpt);
+				return -1;
+			}
+			dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
 
-                        /* Signal Stage 5: devfs registered */
-                        void *gpio = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_DEVICE | MAP_PHYSMEM | MAP_ANONYMOUS, -1, 0xfe200000u);
-                        if (gpio != MAP_FAILED) {
-                                volatile uint32_t *gpioregs = (volatile uint32_t *)gpio;
-                                gpioregs[4] = (gpioregs[4] & ~(7u << 6)) | (1u << 6);
-                                for (int i = 0; i < 5; ++i) {
-                                        gpioregs[8] = (1u << 10); usleep(100000);
-                                        gpioregs[11] = (1u << 10); usleep(100000);
-                                }
-                                munmap(gpio, 4096);
-                        }
-
-                        mountpt = NULL;
-                }
+			mountpt = NULL;
+		}
                 else {
                         portCreate(&port);
                 }
