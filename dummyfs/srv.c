@@ -3,7 +3,7 @@
  *
  * dummyfs server
  *
- * Copyright 2012, 2016, 2018, 2021, 2023 Phoenix Systems
+ * Copyright 2012, 2016, 2018, 2021, 2026 Phoenix Systems
  * Copyright 2007 Pawel Pisarczyk
  * Author: Jacek Popko, Katarzyna Baranowska, Pawel Pisarczyk, Kamil Amanowicz, Maciej Purski
  *
