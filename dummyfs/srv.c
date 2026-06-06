@@ -15,7 +15,6 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/debug.h>
 #include <sys/mman.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
@@ -31,19 +30,6 @@
 
 #define LOG(msg, ...) printf("dummyfs: " msg, ##__VA_ARGS__)
 
-
-enum { traceNone = 0, traceRoot, traceDevfs };
-
-
-static void dummyfs_trace(int traceKind, const char *rootMsg, const char *devfsMsg)
-{
-	if (traceKind == traceRoot) {
-		debug(rootMsg);
-	}
-	else if (traceKind == traceDevfs) {
-		debug(devfsMsg);
-	}
-}
 
 int fetch_modules(dummyfs_t *ctx)
 {
@@ -165,8 +151,6 @@ int main(int argc, char **argv)
 	const char *remount_path = NULL;
 	int non_fs_namespace = 0;
 	int daemonize = 0;
-	int traceKind = traceNone;
-	int lookupTrace = 0;
 	int c;
 
 
@@ -233,8 +217,6 @@ int main(int argc, char **argv)
 	}
 
         if (mountpt == NULL) {
-                traceKind = traceRoot;
-
                 portCreate(&port);
 
                 /* Try to mount fs as root */
@@ -245,13 +227,11 @@ int main(int argc, char **argv)
         }
         else {
                 if (non_fs_namespace) {
-                        traceKind = traceDevfs;
                         portCreate(&port);
 			if (portRegister(port, mountpt, &root) < 0) {
 				LOG("can't mount as %s\n", mountpt);
 				return -1;
 			}
-			dummyfs_trace(traceKind, NULL, "dummyfs: devfs registered\n");
 
 			mountpt = NULL;
 		}
@@ -294,16 +274,10 @@ int main(int argc, char **argv)
 	/*** MAIN LOOP ***/
 
 	LOG("initialized\n");
-	dummyfs_trace(traceKind, "dummyfs: root initialized\n", "dummyfs: devfs initialized\n");
 
 	for (;;) {
 		if (msgRecv(ctx->port, &msg, &rid) < 0)
 			continue;
-
-		if ((traceKind == traceRoot) && (lookupTrace == 0) && (msg.type == mtLookup) && (msg.i.data != NULL) &&
-			(strcmp(msg.i.data, "devfs") == 0)) {
-			debug("dummyfs: root lookup recv\n");
-		}
 
 		switch (msg.type) {
 
@@ -360,11 +334,6 @@ int main(int argc, char **argv)
 
 			case mtLookup:
 				msg.o.err = dummyfs_lookup(ctx, &msg.oid, msg.i.data, &msg.o.lookup.fil, &msg.o.lookup.dev);
-				if ((traceKind == traceRoot) && (lookupTrace == 0) && (msg.i.data != NULL) &&
-					(strcmp(msg.i.data, "devfs") == 0)) {
-					debug("dummyfs: root lookup rsp\n");
-					lookupTrace = 1;
-				}
 				break;
 
                         case mtLink:
