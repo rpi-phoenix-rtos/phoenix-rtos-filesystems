@@ -6,4 +6,7 @@
 # Copyright 2026 Phoenix Systems
 #
 
-DEFAULT_COMPONENTS := dummyfs libext2 libjffs2
+# nfs: userspace NFS-client VFS server (#153). Links the libnfs port; only
+# built for this networked target (do not add unconditionally — a no-network
+# target would ship a dead binary that fails to link without libnfs.a).
+DEFAULT_COMPONENTS := dummyfs libext2 libjffs2 nfs
