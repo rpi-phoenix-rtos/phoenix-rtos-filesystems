@@ -184,6 +184,19 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 		return -ENOENT;
 	}
 
+	/* Lazy-close fast path (#156): the node is parked on the idle LRU with its
+	 * fh still open (refs went to 0 without nfs_close — see nfs_ops_close). The
+	 * loader faulting the next page lands here. Reuse the fh, skip both the
+	 * nfs_open and the nfs_refreshStat RPC. Skipping the re-stat is safe: lazy-
+	 * close already gives up server-side-redeploy detection for a cached fh (the
+	 * fh would point at the old inode regardless), so the stat buys nothing here
+	 * — and a file the loader is actively paging in is not being redeployed. */
+	if ((n->idle != 0) && (n->fh != NULL)) {
+		nfs_node_idleUnlink(&fs->nodes, n);
+		n->refs++;
+		return 0;
+	}
+
 	/* Re-stat on open so a redeployed file isn't shadowed (OQ-B). */
 	struct nfs_stat_64 st;
 	int rc = nfs_refreshStat(fs, n, &st);
@@ -221,9 +234,25 @@ int nfs_ops_close(nfs_fs_t *fs, oid_t *oid)
 		n->refs--;
 	}
 
-	if ((n->refs == 0) && (n->fh != NULL)) {
-		nfs_close(fs->nfs, n->fh);
-		n->fh = NULL;
+	/* Lazy-close (#156): on the last close, do NOT nfs_close the fh. Park the
+	 * node on the idle LRU so the next open reuses the open fh (collapsing the
+	 * loader's per-page open/close RPC pair). Only an over-cap eviction, an
+	 * unlink, or a destroy actually nfs_close()s a cached fh. */
+	if ((n->refs == 0) && (n->fh != NULL) && (n->idle == 0)) {
+		nfs_node_idlePush(&fs->nodes, n);
+
+		/* Bound the cached-open fhs: evict the LRU tail when over cap. */
+		if (fs->nodes.idleCount > NFS_IDLE_MAX) {
+			nfs_node_t *lru = nfs_node_idleLru(&fs->nodes);
+			if ((lru != NULL) && (lru != n)) {
+				if (lru->fh != NULL) {
+					nfs_close(fs->nfs, lru->fh);
+					lru->fh = NULL;
+				}
+				nfs_node_idleUnlink(&fs->nodes, lru);
+				printf("nfs-fs: fh-cache evict, %u idle\n", fs->nodes.idleCount);
+			}
+		}
 	}
 
 	return 0;
@@ -623,6 +652,12 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	nfs_node_t *n = nfs_node_findPath(&fs->nodes, path);
 	free(path);
 	if ((rc == 0) && (n != NULL) && (n->refs == 0)) {
+		/* A node at refs==0 may still hold a lazily-cached fh on the idle LRU
+		 * (#156); close it before removing so the fh isn't leaked. */
+		if (n->fh != NULL) {
+			nfs_close(fs->nfs, n->fh);
+			n->fh = NULL;
+		}
 		nfs_node_remove(&fs->nodes, n);
 	}
 

@@ -36,6 +36,14 @@ typedef struct nfs_node {
 	                         means "no mount" (so lookup returns this node itself). Mirrors the
 	                         dummyfs object `dev` field — required so a child fs (e.g. devfs at
 	                         /dev once the NFS export owns "/") is reachable. (#153 T3 design-A) */
+	/* Lazy-close fh cache (#156): when refs falls to 0 with fh != NULL, the node
+	 * is parked on the tree's idle LRU instead of nfs_close()ing the fh, so the
+	 * next open (e.g. the loader faulting the next page) reuses the open fh and
+	 * skips the nfs_open/nfs_close RPC pair. Handle caching only — no data is
+	 * cached, so no stale-data risk. idle != 0 iff the node is on idleHead. */
+	int idle;                  /* 1 while parked on the idle LRU, else 0 */
+	struct nfs_node *idleNext; /* idle LRU (MRU at head); valid only while idle != 0 */
+	struct nfs_node *idlePrev;
 } nfs_node_t;
 
 
@@ -43,7 +51,16 @@ typedef struct nfs_nodeTree {
 	rbtree_t byId;
 	rbtree_t byPath;
 	id_t nextId;
+	nfs_node_t *idleHead; /* MRU end of the lazy-close idle LRU (NULL = empty) */
+	nfs_node_t *idleTail; /* LRU end; evicted first when idleCount > NFS_IDLE_MAX */
+	unsigned idleCount;   /* number of nodes currently on the idle LRU */
 } nfs_nodeTree_t;
+
+
+/* Cap on cached-open fhs parked on the idle LRU. Bounds open-fh consumption on
+ * the NFS server/client so lazy-close can't exhaust either; the tail is evicted
+ * (nfs_close) once exceeded. Small: the loader pages one file at a time. */
+#define NFS_IDLE_MAX 16
 
 
 /* Initialize the table and create the root node (id 0, path "/"). */
@@ -59,8 +76,20 @@ extern nfs_node_t *nfs_node_findPath(nfs_nodeTree_t *t, const char *path);
  * lookups of the same path return the same node/id). Returns NULL on OOM. */
 extern nfs_node_t *nfs_node_get(nfs_nodeTree_t *t, const char *path);
 
-/* Remove and free a node (used on destroy/unlink-last-close). */
+/* Remove and free a node (used on destroy/unlink-last-close). Defensively
+ * unlinks the node from the idle LRU first; the caller is responsible for
+ * nfs_close()ing n->fh (which needs the libnfs context) beforehand. */
 extern void nfs_node_remove(nfs_nodeTree_t *t, nfs_node_t *n);
+
+/* Lazy-close idle LRU (#156), structural only (no nfs_close — see nfs_ops.c):
+ * push a node to the MRU head (sets idle, bumps idleCount) and unlink it
+ * (clears idle, decrements idleCount). idle_unlink is a no-op if not parked. */
+extern void nfs_node_idlePush(nfs_nodeTree_t *t, nfs_node_t *n);
+extern void nfs_node_idleUnlink(nfs_nodeTree_t *t, nfs_node_t *n);
+
+/* Return the LRU (tail) node for eviction, or NULL if the idle LRU is empty.
+ * Does not unlink it — the caller nfs_close()s the fh then idleUnlinks. */
+extern nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t);
 
 /* Join a parent directory path and a single name component into a freshly
  * malloc'd canonical export-relative path. Caller frees. Returns NULL on OOM. */

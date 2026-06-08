@@ -46,6 +46,9 @@ int nfs_node_init(nfs_nodeTree_t *t)
 	lib_rbInit(&t->byId, nfs_cmpId, NULL);
 	lib_rbInit(&t->byPath, nfs_cmpPath, NULL);
 	t->nextId = NFS_ROOTID + 1;
+	t->idleHead = NULL;
+	t->idleTail = NULL;
+	t->idleCount = 0;
 
 	nfs_node_t *root = calloc(1, sizeof(nfs_node_t));
 	if (root == NULL) {
@@ -133,10 +136,66 @@ void nfs_node_remove(nfs_nodeTree_t *t, nfs_node_t *n)
 		return;
 	}
 
+	/* Defensive: a node about to be freed must not linger on the idle LRU
+	 * (#156). The caller closed n->fh already; here we only fix the links. */
+	nfs_node_idleUnlink(t, n);
+
 	lib_rbRemove(&t->byId, &n->idLinkage);
 	lib_rbRemove(&t->byPath, &n->pathLinkage);
 	free(n->path);
 	free(n);
+}
+
+
+void nfs_node_idlePush(nfs_nodeTree_t *t, nfs_node_t *n)
+{
+	if ((n == NULL) || (n->idle != 0)) {
+		return;
+	}
+
+	n->idlePrev = NULL;
+	n->idleNext = t->idleHead;
+	if (t->idleHead != NULL) {
+		t->idleHead->idlePrev = n;
+	}
+	t->idleHead = n;
+	if (t->idleTail == NULL) {
+		t->idleTail = n;
+	}
+	n->idle = 1;
+	t->idleCount++;
+}
+
+
+void nfs_node_idleUnlink(nfs_nodeTree_t *t, nfs_node_t *n)
+{
+	if ((n == NULL) || (n->idle == 0)) {
+		return;
+	}
+
+	if (n->idlePrev != NULL) {
+		n->idlePrev->idleNext = n->idleNext;
+	}
+	else {
+		t->idleHead = n->idleNext;
+	}
+	if (n->idleNext != NULL) {
+		n->idleNext->idlePrev = n->idlePrev;
+	}
+	else {
+		t->idleTail = n->idlePrev;
+	}
+
+	n->idleNext = NULL;
+	n->idlePrev = NULL;
+	n->idle = 0;
+	t->idleCount--;
+}
+
+
+nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t)
+{
+	return t->idleTail;
 }
 
 
