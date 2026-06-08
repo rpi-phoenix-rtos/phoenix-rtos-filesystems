@@ -128,7 +128,11 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		int rc = nfs_lstat64(fs->nfs, child, &st);
 		if (rc != 0) {
 			free(child);
-			return -ENOENT;
+			/* Route through nfs_err so a transient RPC error (EIO/ESTALE/
+			 * ETIMEDOUT) is reported as itself rather than masked as "no such
+			 * file". A genuine missing entry still maps to -ENOENT (libnfs
+			 * returns -ENOENT for NFS*ERR_NOENT). */
+			return nfs_err(rc);
 		}
 
 		nfs_node_t *cn = nfs_node_get(&fs->nodes, child);
