@@ -344,20 +344,23 @@ static struct nfs_context *nfs_makeContext(int version)
 
 /* Root mode (#153 T3): mount the NFS export and portRegister it AS "/".
  *
- * Pre-"/" we cannot fopen("/dev/ifstatus") to wait for DHCP, so instead we
- * first settle 10 s (let lwip bring up genet + finish its own DHCP without a
- * socket() storm starving the tcpip thread), then bounded-retry
- * nfs_init_context+nfs_mount with a 3 s backoff until it succeeds or a ~90 s
- * deadline expires. nfs_set_timeout(5000) bounds each attempt; DHCP completing
- * is observed indirectly by the mount succeeding. The socket libnfs opens
- * during nfs_mount resolves via the libphoenix socksrvcall "devfs/netsocket"
- * fallback (the only client-side resolver that works before "/" exists).
+ * NOT FUNCTIONAL on the current kernel — kept for reference only; the working
+ * NFS-as-root path is takeover mode (nfs_runTakeover) below. Root mode founders
+ * on socket() name resolution pre-"/": the kernel resolver does not forward a
+ * "devfs/<name>" mtLookup to the registered "devfs" named port before a root
+ * "/" exists (T3 finding, docs/research/.../T3-attempt-1-result.md UPDATE 3),
+ * so libnfs cannot open its socket during nfs_mount and the export never gets
+ * registered as "/". Fixing that would be a core kernel namespace change;
+ * takeover mode sidesteps it by mounting after a RAM "/" already exists.
  *
- * On a successful mount we portRegister(port, "/") directly (mirroring the
- * dummyfs root path, dummyfs/srv.c:219-227, and the SD ext2-root,
- * sdstorage_srv.c). We do NOT start nfs_mountThread: its mtSetAttr(atDev)
- * splice waits for an *existing* "/", which would deadlock when we ARE "/".
- * parent stays {own-port, NFS_ROOTID} (self), so ".." at "/" stays at "/". */
+ * The mechanics below are retained as the reference design: pre-"/" we cannot
+ * fopen("/dev/ifstatus") to wait for DHCP, so we settle 10 s then bounded-retry
+ * nfs_init_context+nfs_mount with a 3 s backoff until success or a ~90 s
+ * deadline. On a successful mount we portRegister(port, "/") directly (mirroring
+ * the dummyfs root path and the SD ext2-root). We do NOT start nfs_mountThread:
+ * its mtSetAttr(atDev) splice waits for an *existing* "/", which would deadlock
+ * when we ARE "/". parent stays {own-port, NFS_ROOTID} (self), so ".." at "/"
+ * stays at "/". */
 static int nfs_runRoot(const char *server, const char *export, const char *verstr, int version)
 {
 	const int deadline_s = 90;
