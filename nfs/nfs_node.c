@@ -61,6 +61,7 @@ int nfs_node_init(nfs_nodeTree_t *t)
 	root->fh = NULL;
 	root->type = otDir;
 	root->refs = 0;
+	root->mnt.port = 0; /* no child mounted here yet (calloc already zeroed it) */
 
 	lib_rbInsert(&t->byId, &root->idLinkage);
 	lib_rbInsert(&t->byPath, &root->pathLinkage);

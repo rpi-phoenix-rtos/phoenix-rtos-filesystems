@@ -32,6 +32,10 @@ typedef struct nfs_node {
 	struct nfsfh *fh;     /* non-NULL while open; else NULL */
 	int type;             /* otDir/otFile/otSymlink/otDev (from nfs_lstat64, don't-follow) */
 	unsigned refs;        /* mtOpen refcount */
+	oid_t mnt;            /* mounted-child oid spliced here via mtSetAttr(atDev); mnt.port==0
+	                         means "no mount" (so lookup returns this node itself). Mirrors the
+	                         dummyfs object `dev` field — required so a child fs (e.g. devfs at
+	                         /dev once the NFS export owns "/") is reachable. (#153 T3 design-A) */
 } nfs_node_t;
 
 

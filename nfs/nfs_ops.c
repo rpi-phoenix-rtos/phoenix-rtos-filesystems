@@ -142,6 +142,16 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		node = cn;
 		cur = cn->path;
 
+		/* Mountpoint: a child fs is spliced here (mtSetAttr(atDev)). Hand back
+		 * the child oid and stop — the kernel re-resolves the remaining path in
+		 * the child fs (mirrors dummyfs.c:104-109). This is what makes /dev
+		 * reachable after the NFS export takes over "/" (#153 T3 design-A). */
+		if (cn->mnt.port != 0) {
+			*res = cn->mnt;
+			*dev = cn->mnt;
+			return len;
+		}
+
 		/* If the resolved component is not a directory but more path remains,
 		 * fail like dummyfs. */
 		if ((name[len] != '\0') && (cn->type != otDir)) {
@@ -158,7 +168,10 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 
 	res->port = fs->port;
 	res->id = node->id;
-	*dev = *res;
+	/* If the final node is itself a mountpoint, hand back the spliced child as
+	 * the dev oid so the kernel redirects into it (e.g. a bare lookup of /dev
+	 * after takeover — #153 T3 design-A). Otherwise dev == the node itself. */
+	*dev = (node->mnt.port != 0) ? node->mnt : *res;
 
 	return len;
 }
@@ -469,11 +482,16 @@ int nfs_ops_setattr(nfs_fs_t *fs, oid_t *oid, int type, long long val, const voi
 
 		case atDev:
 			/* Inbound mount-splice: a child fs mounts onto one of OUR dirs.
-			 * For T3b this is rare; accept it (we do not yet forward ops to a
-			 * mounted child — documented as incomplete). */
+			 * Store the child's oid on the node (mirrors dummyfs's per-object
+			 * `dev`); lookup then hands it back so the kernel redirects path
+			 * resolution into the child fs. This is the mechanism that makes
+			 * `bind devfs /dev` work once the NFS export owns "/" (#153 T3
+			 * design-A) — without it the re-bind would silently no-op and /dev
+			 * on the NFS root would be empty. */
 			if ((data == NULL) || (size != sizeof(oid_t)) || (n->type != otDir)) {
 				return -EINVAL;
 			}
+			memcpy(&n->mnt, data, sizeof(oid_t));
 			return 0;
 
 		default:

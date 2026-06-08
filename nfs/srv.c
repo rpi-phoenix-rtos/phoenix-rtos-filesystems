@@ -13,15 +13,26 @@
  * pool-thread-stack-overflow lesson: the NFS call chain msgRecv -> handler ->
  * libnfs sync -> XDR -> socket-to-lwip is deeper than ext2-over-SD).
  *
- * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4] [root]
+ * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4] [root|takeover]
  *   defaults:   nfs /nfstest 10.42.0.1 / v4
  *
  * Root mode (a trailing "root" token, #153 T3): the NFS export becomes "/"
- * itself. The server then accepts "/" as the mountpoint, skips the
- * fopen("/dev/ifstatus") DHCP-wait (unusable pre-"/"), bounded-retries
- * nfs_init_context+nfs_mount until DHCP lands (or a deadline), and
- * portRegister("/")s the export directly instead of splicing under an
- * existing directory. Example: nfs / 10.42.0.1 / v4 root.
+ * itself, registered BEFORE any RAM "/" exists. The server accepts "/" as the
+ * mountpoint, skips the fopen("/dev/ifstatus") DHCP-wait (unusable pre-"/"),
+ * bounded-retries nfs_init_context+nfs_mount until DHCP lands (or a deadline),
+ * and portRegister("/")s the export directly. Example: nfs / 10.42.0.1 / v4
+ * root. (Blocked in practice by the kernel pre-"/" name-resolver gap, #153 T3
+ * Gap B — kept for reference; design-A/takeover is the working path.)
+ *
+ * Takeover mode (a trailing "takeover" token, #153 T3 design-A): the NFS
+ * export becomes "/", but AFTER a normal dummyfs RAM "/" + /dev bind + lwip
+ * have come up. Because "/" already exists, sockets resolve normally and we
+ * reuse the SAME proven subtree path as the /nfstest mount: the normal
+ * /dev/ifstatus DHCP-wait, then nfs_makeContext + nfs_mount. We then TAKE OVER
+ * "/": first try the mtSetAttr(atDev) splice onto the "/" oid (the same
+ * mechanism the /nfstest mount uses), re-resolve "/" to see whether the kernel
+ * honored it, and if not fall back to portUnregister("/") + portRegister("/").
+ * Example: nfs / 10.42.0.1 / v4 takeover.
  *
  * Copyright 2026 Phoenix Systems
  *
@@ -430,22 +441,171 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 }
 
 
+/* Takeover mode (#153 T3 design-A): mount the NFS export and make it "/" AFTER
+ * a normal dummyfs RAM "/" already exists. Reuses the proven subtree path
+ * (normal /dev/ifstatus DHCP-wait + nfs_makeContext + nfs_mount — sockets
+ * resolve normally because "/" and /dev are up), then takes over "/".
+ *
+ * Takeover mechanism + the runtime decision between the two paths:
+ *   1. Resolve the current "/" oid (the dummyfs root) and try the mtSetAttr
+ *      (atDev) splice onto it — the same splice the /nfstest mount uses, just
+ *      targeting "/". Then re-resolve "/": if it now points at OUR port the
+ *      splice took, log "via splice". (In practice the kernel returns the
+ *      registered rootOid for a bare "/" lookup without consulting the root
+ *      node's atDev, name.c:239-256, so the splice no-ops for "/" and the
+ *      fallback below is what actually fires — we still try it first + decide
+ *      at runtime so the log reflects reality on any kernel.)
+ *   2. Fallback: portUnregister("/") then portRegister(port,"/"). This is the
+ *      definitive takeover (proc_portUnregister clears rootRegistered, then
+ *      proc_portRegister installs our oid as rootOid). */
+static int nfs_runTakeover(const char *server, const char *export, const char *verstr, int version)
+{
+	char ipbuf[64] = "";
+
+	/* "/" already exists, so the normal /dev/ifstatus DHCP-wait works (unlike
+	 * the pre-"/" root mode). Reuse the subtree-mode wait. */
+	if (wait_for_dhcp_lease(ipbuf, sizeof(ipbuf), 30000) != 0) {
+		LOG("FATAL takeover: no DHCP lease in 30s, / not taken over\n");
+		return 2;
+	}
+	LOG("takeover: interface bound, ip=%s\n", ipbuf);
+
+	common.fs.nfs = nfs_makeContext(version);
+	if (common.fs.nfs == NULL) {
+		LOG("FATAL takeover: nfs_init_context\n");
+		return 3;
+	}
+
+	if (nfs_mount(common.fs.nfs, server, export) != 0) {
+		LOG("FATAL takeover: mount %s:%s: %s\n", server, export, nfs_get_error(common.fs.nfs));
+		nfs_destroy_context(common.fs.nfs);
+		return 4;
+	}
+	/* Same marker the subtree mount prints — the orchestrator reads this first:
+	 * it proves sockets work with a dummyfs "/" up (the design-A premise). */
+	LOG("mounted %s:%s via %s\n", server, export, verstr);
+
+	if (nfs_node_init(&common.fs.nodes) != 0) {
+		LOG("FATAL takeover: node table init\n");
+		return 5;
+	}
+
+	if (portCreate(&common.fs.port) != 0) {
+		LOG("FATAL takeover: portCreate\n");
+		return 6;
+	}
+
+	/* "/" has no parent — self-parent so ".." at "/" stays at "/" (POSIX). */
+	common.fs.parent.port = common.fs.port;
+	common.fs.parent.id = NFS_ROOTID;
+
+	oid_t self = { .port = common.fs.port, .id = NFS_ROOTID };
+
+	/* Re-bind /dev onto the NFS root, IN-PROCESS, before we become "/".
+	 *
+	 * The boot script's `bind devfs /dev` registered /dev in the *dummyfs*
+	 * root's namespace; once we own "/", that bind is in the old root and /dev
+	 * would be empty here. The device nodes themselves live in the "devfs"
+	 * named-port process (a kernel-dcache name, untouched by the root swap), so
+	 * all we must do is splice that devfs port onto OUR /dev node — exactly
+	 * what `bind devfs /dev` does (mtSetAttr(atDev)), but done in-process so
+	 * there is no second `bind` program and no race: by the time we register
+	 * "/", /dev already resolves. (Equivalent to the kernel mount machinery;
+	 * uses the node->mnt field added for #153 T3 design-A.) */
+	oid_t devfsOid;
+	if (lookup("devfs", NULL, &devfsOid) == 0) {
+		/* Materialize /dev on the export if absent (EEXIST is fine). */
+		(void)nfs_mkdir2(common.fs.nfs, "/dev", 0755);
+		nfs_node_t *devNode = nfs_node_get(&common.fs.nodes, "/dev");
+		if (devNode != NULL) {
+			devNode->type = otDir;
+			devNode->mnt = devfsOid;
+			LOG("re-bound /dev (takeover, devfs port=%u)\n", devfsOid.port);
+		}
+		else {
+			LOG("re-bind /dev: node alloc failed (devfs at /dev will be empty)\n");
+		}
+	}
+	else {
+		LOG("re-bind /dev: devfs port not found (devfs at /dev will be empty)\n");
+	}
+
+	/* Start serving BEFORE the takeover so the new "/" answers lookups the
+	 * instant it is installed (no window where "/" resolves to a dead port). */
+	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
+
+	/* Path 1: try the proven mtSetAttr(atDev) splice onto the existing "/". */
+	oid_t oldRoot;
+	int tookOver = 0;
+	if (lookup("/", NULL, &oldRoot) == 0) {
+		msg_t msg = { 0 };
+		msg.type = mtSetAttr;
+		msg.oid = oldRoot;
+		msg.i.attr.type = atDev;
+		msg.i.data = &self;
+		msg.i.size = sizeof(oid_t);
+		int err = msgSend(oldRoot.port, &msg);
+		int spliceRc = (err < 0) ? err : msg.o.err;
+
+		/* Decide at runtime: did the splice make "/" resolve to OUR port? */
+		oid_t check;
+		if ((spliceRc == 0) && (lookup("/", NULL, &check) == 0) && (check.port == common.fs.port)) {
+			LOG("takeover via splice rc=%d\n", spliceRc);
+			tookOver = 1;
+		}
+		else {
+			LOG("takeover via splice rc=%d (not honored for /, falling back to portRegister)\n", spliceRc);
+		}
+	}
+	else {
+		LOG("takeover: could not resolve existing / for splice, falling back to portRegister\n");
+	}
+
+	/* Path 2 (fallback): unregister the old "/" then register ours. */
+	if (tookOver == 0) {
+		int urc = portUnregister("/");
+		int prc = portRegister(common.fs.port, "/", &self);
+		LOG("takeover via portRegister rc=%d (unregister rc=%d)\n", prc, urc);
+		if (prc < 0) {
+			LOG("FATAL takeover: portRegister(/) failed, / not taken over\n");
+			return 7;
+		}
+	}
+
+	LOG("registered / (takeover)\n");
+
+	/* The loop thread serves "/" forever; park the main thread. */
+	for (;;) {
+		usleep(1000000);
+	}
+
+	return 0;
+}
+
+
 int main(int argc, char **argv)
 {
 	const char *mountpt = (argc > 1) ? argv[1] : "/nfstest";
 	const char *server = (argc > 2) ? argv[2] : "10.42.0.1";
 	const char *export = (argc > 3) ? argv[3] : "/";
 	const char *verstr = (argc > 4) ? argv[4] : "v4";
-	/* A trailing "root" token selects root mode (register the export as "/"). */
+	/* A trailing token selects a special mode: "root" registers the export as
+	 * "/" pre-"/"; "takeover" mounts it as "/" after a RAM "/" already exists. */
 	int rootMode = (argc > 5) && (strcmp(argv[5], "root") == 0);
+	int takeoverMode = (argc > 5) && (strcmp(argv[5], "takeover") == 0);
 	char ipbuf[64] = "";
 
 	int version = (strcmp(verstr, "v3") == 0) ? NFS_V3 : NFS_V4;
 
-	LOG("start (mountpt=%s server=%s export=%s %s%s)\n", mountpt, server, export, verstr, rootMode ? " root" : "");
+	LOG("start (mountpt=%s server=%s export=%s %s%s%s)\n", mountpt, server, export, verstr,
+		rootMode ? " root" : "", takeoverMode ? " takeover" : "");
 
 	if (rootMode) {
 		return nfs_runRoot(server, export, verstr, version);
+	}
+
+	if (takeoverMode) {
+		return nfs_runTakeover(server, export, verstr, version);
 	}
 
 	if (mountpt[0] != '/' || strcmp(mountpt, "/") == 0) {
