@@ -373,17 +373,6 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 	LOG("settling 10s before first mount (lets lwip finish DHCP)\n");
 	sleep(10);
 
-	/* One-shot probe: does the pre-"/" socket resolver node resolve post-settle?
-	 * Isolates "socketsrv not ready / lwip has no lease" from "name unresolved". */
-	oid_t probe;
-	int probeRc = lookup("devfs/netsocket", NULL, &probe);
-	LOG("probe devfs/netsocket rc=%d\n", probeRc);
-	/* DIAG(#153-T3 Gap B): also probe the literal path cross-process, so we can
-	 * compare lwip's own self-lookups against this nfs-process view. Revertable. */
-	oid_t probeLit;
-	int probeLitRc = lookup("/dev/netsocket", NULL, &probeLit);
-	LOG("probe /dev/netsocket rc=%d\n", probeLitRc);
-
 	for (;;) {
 		struct nfs_context *nfs = nfs_makeContext(version);
 		if (nfs != NULL) {

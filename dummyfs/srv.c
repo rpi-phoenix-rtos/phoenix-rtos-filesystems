@@ -307,19 +307,6 @@ int main(int argc, char **argv)
 
 			case mtCreate:
 				msg.o.err = dummyfs_create(ctx, &msg.oid, msg.i.data, &msg.o.create.oid, msg.i.create.mode, msg.i.create.type, &msg.i.create.dev);
-				/* DIAG(#153-T3 Gap B): server-side trace of the netsocket node
-				 * lifecycle. create_dev/lookup are provably symmetric in source
-				 * (both target root id=0), yet HW shows netsocket created rc=0 but
-				 * unreachable pre-"/". The existing DIAG is all client-side
-				 * (lwip/nfs); this is the missing server view: which port/pid
-				 * received the mtCreate, into which parent dir oid, and the
-				 * resulting node oid. Filtered to "netsocket" so normal boots stay
-				 * quiet. Revertable. */
-				if ((msg.i.data != NULL) && (strcmp((const char *)msg.i.data, "netsocket") == 0)) {
-					LOG("DIAG create netsocket: pid=%d port=%u dir.id=%llu rc=%d -> node.port=%u node.id=%llu\n",
-						(int)getpid(), ctx->port, (unsigned long long)msg.oid.id, msg.o.err,
-						msg.o.create.oid.port, (unsigned long long)msg.o.create.oid.id);
-				}
 				break;
 
 			case mtDestroy:
@@ -347,17 +334,6 @@ int main(int argc, char **argv)
 
 			case mtLookup:
 				msg.o.err = dummyfs_lookup(ctx, &msg.oid, msg.i.data, &msg.o.lookup.fil, &msg.o.lookup.dev);
-				/* DIAG(#153-T3 Gap B): server-side trace of the netsocket lookup —
-				 * pairs with the mtCreate DIAG above. Logs which port/pid served
-				 * the lookup, from which parent dir oid the search started, and the
-				 * rc. If create and lookup print the SAME pid+port+dir.id yet rc
-				 * differs, Gap B is a same-instance create-vs-find bug; if pid/port
-				 * differ, it is a separate-instance/ordering problem. Filtered to
-				 * "netsocket". Revertable. */
-				if ((msg.i.data != NULL) && (strcmp((const char *)msg.i.data, "netsocket") == 0)) {
-					LOG("DIAG lookup netsocket: pid=%d port=%u dir.id=%llu rc=%d\n",
-						(int)getpid(), ctx->port, (unsigned long long)msg.oid.id, msg.o.err);
-				}
 				break;
 
                         case mtLink:
