@@ -13,8 +13,15 @@
  * pool-thread-stack-overflow lesson: the NFS call chain msgRecv -> handler ->
  * libnfs sync -> XDR -> socket-to-lwip is deeper than ext2-over-SD).
  *
- * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4]
+ * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4] [root]
  *   defaults:   nfs /nfstest 10.42.0.1 / v4
+ *
+ * Root mode (a trailing "root" token, #153 T3): the NFS export becomes "/"
+ * itself. The server then accepts "/" as the mountpoint, skips the
+ * fopen("/dev/ifstatus") DHCP-wait (unusable pre-"/"), bounded-retries
+ * nfs_init_context+nfs_mount until DHCP lands (or a deadline), and
+ * portRegister("/")s the export directly instead of splicing under an
+ * existing directory. Example: nfs / 10.42.0.1 / v4 root.
  *
  * Copyright 2026 Phoenix Systems
  *
@@ -26,6 +33,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
@@ -306,20 +314,122 @@ static void nfs_loopThread(void *arg)
 }
 
 
+/* (Re-)create a libnfs context with our fixed transfer parameters. Used by the
+ * root-mode bounded-retry loop, which throws away and rebuilds the context on
+ * each failed mount attempt. */
+static struct nfs_context *nfs_makeContext(int version)
+{
+	struct nfs_context *nfs = nfs_init_context();
+	if (nfs == NULL) {
+		return NULL;
+	}
+	nfs_set_version(nfs, version);
+	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
+	nfs_set_readmax(nfs, 32 * 1024);
+	nfs_set_writemax(nfs, 32 * 1024);
+	return nfs;
+}
+
+
+/* Root mode (#153 T3): mount the NFS export and portRegister it AS "/".
+ *
+ * Pre-"/" we cannot fopen("/dev/ifstatus") to wait for DHCP, so instead we
+ * bounded-retry nfs_init_context+nfs_mount until it succeeds or a ~60 s
+ * deadline expires. nfs_set_timeout(5000) bounds each attempt; DHCP completing
+ * is observed indirectly by the mount succeeding. The socket libnfs opens
+ * during nfs_mount resolves via the libphoenix socksrvcall "devfs/netsocket"
+ * fallback (the only client-side resolver that works before "/" exists).
+ *
+ * On a successful mount we portRegister(port, "/") directly (mirroring the
+ * dummyfs root path, dummyfs/srv.c:219-227, and the SD ext2-root,
+ * sdstorage_srv.c). We do NOT start nfs_mountThread: its mtSetAttr(atDev)
+ * splice waits for an *existing* "/", which would deadlock when we ARE "/".
+ * parent stays {own-port, NFS_ROOTID} (self), so ".." at "/" stays at "/". */
+static int nfs_runRoot(const char *server, const char *export, const char *verstr, int version)
+{
+	const int deadline_s = 60;
+	time_t start = time(NULL);
+	int attempt = 0;
+
+	LOG("root mode: mounting %s:%s as / (bounded retry, %ds deadline)\n", server, export, deadline_s);
+
+	for (;;) {
+		struct nfs_context *nfs = nfs_makeContext(version);
+		if (nfs != NULL) {
+			if (nfs_mount(nfs, server, export) == 0) {
+				common.fs.nfs = nfs;
+				break;
+			}
+			LOG("root mount attempt %d failed: %s\n", attempt, nfs_get_error(nfs));
+			nfs_destroy_context(nfs);
+		}
+		else {
+			LOG("root mount attempt %d: nfs_init_context returned NULL\n", attempt);
+		}
+
+		if ((time(NULL) - start) >= deadline_s) {
+			LOG("FATAL root mount failed after %ds, / not registered\n", deadline_s);
+			return 2;
+		}
+		attempt++;
+		usleep(1000000); /* don't hot-loop on fast connect-refused failures */
+	}
+
+	LOG("root mode: mounted %s:%s via %s after %d retr%s\n", server, export, verstr, attempt, (attempt == 1) ? "y" : "ies");
+
+	if (nfs_node_init(&common.fs.nodes) != 0) {
+		LOG("FAIL node table init\n");
+		return 5;
+	}
+
+	if (portCreate(&common.fs.port) != 0) {
+		LOG("FAIL portCreate\n");
+		return 6;
+	}
+
+	/* "/" has no parent — self-parent so ".." at "/" stays at "/" (POSIX). */
+	common.fs.parent.port = common.fs.port;
+	common.fs.parent.id = NFS_ROOTID;
+
+	oid_t root = { .port = common.fs.port, .id = NFS_ROOTID };
+	if (portRegister(common.fs.port, "/", &root) < 0) {
+		LOG("FATAL portRegister(/) failed, / not registered\n");
+		return 7;
+	}
+	LOG("registered / (root mode)\n");
+
+	/* Run the message loop on its own >=64 KB stack (the primary stack may be
+	 * the 8 KB default). No splice thread in root mode. */
+	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
+
+	for (;;) {
+		usleep(1000000);
+	}
+
+	return 0;
+}
+
+
 int main(int argc, char **argv)
 {
 	const char *mountpt = (argc > 1) ? argv[1] : "/nfstest";
 	const char *server = (argc > 2) ? argv[2] : "10.42.0.1";
 	const char *export = (argc > 3) ? argv[3] : "/";
 	const char *verstr = (argc > 4) ? argv[4] : "v4";
+	/* A trailing "root" token selects root mode (register the export as "/"). */
+	int rootMode = (argc > 5) && (strcmp(argv[5], "root") == 0);
 	char ipbuf[64] = "";
 
 	int version = (strcmp(verstr, "v3") == 0) ? NFS_V3 : NFS_V4;
 
-	LOG("start (mountpt=%s server=%s export=%s %s)\n", mountpt, server, export, verstr);
+	LOG("start (mountpt=%s server=%s export=%s %s%s)\n", mountpt, server, export, verstr, rootMode ? " root" : "");
+
+	if (rootMode) {
+		return nfs_runRoot(server, export, verstr, version);
+	}
 
 	if (mountpt[0] != '/' || strcmp(mountpt, "/") == 0) {
-		LOG("refusing to register '/' (that is T3, the rootfs case) — give a subtree like /nfstest\n");
+		LOG("refusing to register '/' (that is the root case — pass the trailing 'root' token); give a subtree like /nfstest\n");
 		return 1;
 	}
 
@@ -329,16 +439,11 @@ int main(int argc, char **argv)
 	}
 	LOG("interface bound, ip=%s\n", ipbuf);
 
-	common.fs.nfs = nfs_init_context();
+	common.fs.nfs = nfs_makeContext(version);
 	if (common.fs.nfs == NULL) {
 		LOG("FAIL nfs_init_context\n");
 		return 3;
 	}
-
-	nfs_set_version(common.fs.nfs, version);
-	nfs_set_timeout(common.fs.nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
-	nfs_set_readmax(common.fs.nfs, 32 * 1024);
-	nfs_set_writemax(common.fs.nfs, 32 * 1024);
 
 	if (nfs_mount(common.fs.nfs, server, export) != 0) {
 		LOG("FAIL mount %s:%s: %s\n", server, export, nfs_get_error(common.fs.nfs));
