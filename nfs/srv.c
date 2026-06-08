@@ -334,7 +334,9 @@ static struct nfs_context *nfs_makeContext(int version)
 /* Root mode (#153 T3): mount the NFS export and portRegister it AS "/".
  *
  * Pre-"/" we cannot fopen("/dev/ifstatus") to wait for DHCP, so instead we
- * bounded-retry nfs_init_context+nfs_mount until it succeeds or a ~60 s
+ * first settle 10 s (let lwip bring up genet + finish its own DHCP without a
+ * socket() storm starving the tcpip thread), then bounded-retry
+ * nfs_init_context+nfs_mount with a 3 s backoff until it succeeds or a ~90 s
  * deadline expires. nfs_set_timeout(5000) bounds each attempt; DHCP completing
  * is observed indirectly by the mount succeeding. The socket libnfs opens
  * during nfs_mount resolves via the libphoenix socksrvcall "devfs/netsocket"
@@ -347,11 +349,24 @@ static struct nfs_context *nfs_makeContext(int version)
  * parent stays {own-port, NFS_ROOTID} (self), so ".." at "/" stays at "/". */
 static int nfs_runRoot(const char *server, const char *export, const char *verstr, int version)
 {
-	const int deadline_s = 60;
+	const int deadline_s = 90;
 	time_t start = time(NULL);
 	int attempt = 0;
 
 	LOG("root mode: mounting %s:%s as / (bounded retry, %ds deadline)\n", server, export, deadline_s);
+
+	/* Initial settle: in root mode we skip the /dev/ifstatus DHCP-wait (the node
+	 * does not exist pre-"/"), so give lwip time to bring up genet + complete its
+	 * own DHCP before any socket() traffic. Hammering nfs_init_context+nfs_mount
+	 * at ~1 Hz immediately starves lwip's tcpip thread during its DHCP window. */
+	LOG("settling 10s before first mount (lets lwip finish DHCP)\n");
+	sleep(10);
+
+	/* One-shot probe: does the pre-"/" socket resolver node resolve post-settle?
+	 * Isolates "socketsrv not ready / lwip has no lease" from "name unresolved". */
+	oid_t probe;
+	int probeRc = lookup("devfs/netsocket", NULL, &probe);
+	LOG("probe devfs/netsocket rc=%d\n", probeRc);
 
 	for (;;) {
 		struct nfs_context *nfs = nfs_makeContext(version);
@@ -372,7 +387,7 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 			return 2;
 		}
 		attempt++;
-		usleep(1000000); /* don't hot-loop on fast connect-refused failures */
+		usleep(3000000); /* 3 s inter-attempt backoff: reduce the socket() storm into the not-yet-ready socketsrv */
 	}
 
 	LOG("root mode: mounted %s:%s via %s after %d retr%s\n", server, export, verstr, attempt, (attempt == 1) ? "y" : "ies");
