@@ -456,20 +456,24 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 
 	/* "/" already exists, so the normal /dev/ifstatus DHCP-wait works (unlike
 	 * the pre-"/" root mode). Reuse the subtree-mode wait. */
+	/* Failures up to the portUnregister("/") below are non-destructive: the
+	 * dummyfs RAM "/" is still registered, so when this process exits the system
+	 * keeps booting on the (sparse) RAM root rather than bricking with no root.
+	 * These are graceful degrades, not fatal aborts — say so in the log. */
 	if (wait_for_dhcp_lease(ipbuf, sizeof(ipbuf), 30000) != 0) {
-		LOG("FATAL takeover: no DHCP lease in 30s, / not taken over\n");
+		LOG("takeover aborted: no DHCP lease in 30s; keeping RAM root /\n");
 		return 2;
 	}
 	LOG("takeover: interface bound, ip=%s\n", ipbuf);
 
 	common.fs.nfs = nfs_makeContext(version);
 	if (common.fs.nfs == NULL) {
-		LOG("FATAL takeover: nfs_init_context\n");
+		LOG("takeover aborted: nfs_init_context failed; keeping RAM root /\n");
 		return 3;
 	}
 
 	if (nfs_mount(common.fs.nfs, server, export) != 0) {
-		LOG("FATAL takeover: mount %s:%s: %s\n", server, export, nfs_get_error(common.fs.nfs));
+		LOG("takeover aborted: mount %s:%s: %s; keeping RAM root /\n", server, export, nfs_get_error(common.fs.nfs));
 		nfs_destroy_context(common.fs.nfs);
 		return 4;
 	}
@@ -478,12 +482,12 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	LOG("mounted %s:%s via %s\n", server, export, verstr);
 
 	if (nfs_node_init(&common.fs.nodes) != 0) {
-		LOG("FATAL takeover: node table init\n");
+		LOG("takeover aborted: node table init failed; keeping RAM root /\n");
 		return 5;
 	}
 
 	if (portCreate(&common.fs.port) != 0) {
-		LOG("FATAL takeover: portCreate\n");
+		LOG("takeover aborted: portCreate failed; keeping RAM root /\n");
 		return 6;
 	}
 
@@ -553,13 +557,30 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 		LOG("takeover: could not resolve existing / for splice, falling back to portRegister\n");
 	}
 
-	/* Path 2 (fallback): unregister the old "/" then register ours. */
+	/* Path 2 (fallback): unregister the old "/" then register ours. This is the
+	 * one destructive window — between portUnregister and a successful
+	 * portRegister there is briefly no "/". Capture the previous root oid first
+	 * so that if our portRegister fails we can restore it and degrade to the RAM
+	 * root instead of leaving the system with no "/" at all. proc_portRegister
+	 * accepts any port for "/" (no ownership check) and only rejects when one is
+	 * already registered, so this restore is also safe if portUnregister itself
+	 * failed (rootRegistered stays set -> our register -EEXISTs -> restore
+	 * -EEXISTs, "/" still resolves to the dummyfs root). Defensive: portRegister
+	 * post-unregister does not fail in practice, so this branch is unexercised. */
 	if (tookOver == 0) {
+		oid_t prevRoot;
+		int havePrev = (lookup("/", NULL, &prevRoot) == 0);
 		int urc = portUnregister("/");
 		int prc = portRegister(common.fs.port, "/", &self);
 		LOG("takeover via portRegister rc=%d (unregister rc=%d)\n", prc, urc);
 		if (prc < 0) {
-			LOG("FATAL takeover: portRegister(/) failed, / not taken over\n");
+			if (havePrev != 0) {
+				int rrc = portRegister(prevRoot.port, "/", &prevRoot);
+				LOG("takeover failed: portRegister(/) rc=%d; restored RAM root (rc=%d)\n", prc, rrc);
+			}
+			else {
+				LOG("takeover failed: portRegister(/) rc=%d; no prior root captured to restore\n", prc);
+			}
 			return 7;
 		}
 	}
