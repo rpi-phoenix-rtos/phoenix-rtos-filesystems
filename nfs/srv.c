@@ -338,6 +338,13 @@ static struct nfs_context *nfs_makeContext(int version)
 	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
 	nfs_set_readmax(nfs, 32 * 1024);
 	nfs_set_writemax(nfs, 32 * 1024);
+	/* TODO(#156): the first-read-after-takeover ENOENT is a stale libnfs dircache
+	 * (proven: `ls /` missed `etc` + first `cat /etc/hostname` ENOENT'd, both gone
+	 * with nfs_set_dircache(nfs,0)). But disabling it globally regressed file reads
+	 * to ERANGE (cause TBD — likely interaction with the lazy-close fh cache or a
+	 * latent read-attr path the dircache was masking), and libnfs has no
+	 * dircache-invalidate API. Needs a surgical fix (post-mount invalidate or fix
+	 * the ERANGE path) — see docs/inprogress/2026-06-07-nfs-night-progress.md. */
 	return nfs;
 }
 
