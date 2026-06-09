@@ -338,13 +338,17 @@ static struct nfs_context *nfs_makeContext(int version)
 	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
 	nfs_set_readmax(nfs, 32 * 1024);
 	nfs_set_writemax(nfs, 32 * 1024);
-	/* TODO(#156): the first-read-after-takeover ENOENT is a stale libnfs dircache
-	 * (proven: `ls /` missed `etc` + first `cat /etc/hostname` ENOENT'd, both gone
-	 * with nfs_set_dircache(nfs,0)). But disabling it globally regressed file reads
-	 * to ERANGE (cause TBD — likely interaction with the lazy-close fh cache or a
-	 * latent read-attr path the dircache was masking), and libnfs has no
-	 * dircache-invalidate API. Needs a surgical fix (post-mount invalidate or fix
-	 * the ERANGE path) — see docs/inprogress/2026-06-07-nfs-night-progress.md. */
+	/* #156: disable libnfs's directory cache (on by default, libnfs.c:607). It
+	 * cached a partial/stale "/" readdir, so `ls /` returned an incomplete listing
+	 * (missing `etc`/`bin`/`sbin`/...). The flag is read only by nfs_closedir
+	 * (libnfs.c:1774 — cache vs free the readdir result); it does NOT touch the
+	 * lookup/open/pread paths, so this is non-masking and does not affect file
+	 * reads (HW-validated: `ls /` now complete, reads OK). As a VFS server we
+	 * re-lookup per mt op anyway, so caching dir entries here only risks staleness.
+	 * NOTE: this does NOT fix the separate first-lookup-after-psh transient ENOENT
+	 * (still reproduces with the cache off) — that is a different cause (likely
+	 * first-RPC/mount-settle timing right after takeover), tracked under #156. */
+	nfs_set_dircache(nfs, 0);
 	return nfs;
 }
 
