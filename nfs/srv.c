@@ -336,6 +336,13 @@ static struct nfs_context *nfs_makeContext(int version)
 	}
 	nfs_set_version(nfs, version);
 	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
+	/* PERF: libnfs's sync API polls the socket with rpc->poll_timeout (default 100 ms,
+	 * libnfs-sync.c). poll() should return the instant the response arrives (~1 ms here),
+	 * but the Phoenix socket poll() does NOT wake on data-ready — it blocks the FULL timeout
+	 * — so every RPC stalls ~100 ms (measured: 100 ms/op, 0.43 MB/s = 20x too slow). Tighten
+	 * to 1 ms so each RPC completes promptly. This is a targeted workaround; the general fix
+	 * is to make the lwip-port socket poll wake on readiness (benefits all poll/select apps). */
+	nfs_set_poll_timeout(nfs, 1);
 	/* Read/write max per RPC. The old 32 KB cap meant a large sequential read (e.g. an
 	 * 18 MB pak0 for rpi4-quake) became ~576 serialized NFS READ round-trips, which
 	 * dominated load time on the 100 Mbps link (latency-bound, not bandwidth-bound). At
