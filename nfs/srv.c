@@ -336,8 +336,14 @@ static struct nfs_context *nfs_makeContext(int version)
 	}
 	nfs_set_version(nfs, version);
 	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
-	nfs_set_readmax(nfs, 32 * 1024);
-	nfs_set_writemax(nfs, 32 * 1024);
+	/* Read/write max per RPC. The old 32 KB cap meant a large sequential read (e.g. an
+	 * 18 MB pak0 for rpi4-quake) became ~576 serialized NFS READ round-trips, which
+	 * dominated load time on the 100 Mbps link (latency-bound, not bandwidth-bound). At
+	 * 1 MB that's ~18 RPCs (~32x fewer round-trips). libnfs supports up to 4 MB and clamps
+	 * to the server's rtmax/wtmax (Linux nfsd ~1 MB) via FSINFO, so 1 MB is the practical
+	 * sweet spot; must be a multiple of 4096. */
+	nfs_set_readmax(nfs, 1024 * 1024);
+	nfs_set_writemax(nfs, 1024 * 1024);
 	/* #156: disable libnfs's directory cache (on by default, libnfs.c:607). It
 	 * cached a partial/stale "/" readdir, so `ls /` returned an incomplete listing
 	 * (missing `etc`/`bin`/`sbin`/...). The flag is read only by nfs_closedir
