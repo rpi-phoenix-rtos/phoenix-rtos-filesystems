@@ -334,6 +334,16 @@ static struct nfs_context *nfs_makeContext(int version)
 	if (nfs == NULL) {
 		return NULL;
 	}
+	/* #156: use a STABLE, role-distinct NFSv4 client id. libnfs defaults to
+	 * "Libnfs pid:<pid> <time>", which changes every boot -> the server treats
+	 * each reboot as a brand-new client and keeps the previous incarnation's
+	 * lease/state until it expires (~90 s). Rapid reboots then accumulate stale
+	 * state and new mounts intermittently get NFS4ERR_EXPIRED -> the boot-critical
+	 * mount fails (the #156 "pak0 not found"). A fixed id makes a reboot REPLACE
+	 * the prior state (RFC 7530 same-id + new-verifier), and a role-distinct id
+	 * keeps this server's client separate from the nfs-smoke diagnostic on the
+	 * same host. */
+	nfs4_set_client_name(nfs, "phoenix-rpi4-nfsfs");
 	nfs_set_version(nfs, version);
 	nfs_set_timeout(nfs, 5000); /* bound every RPC so one drop can't wedge the loop */
 	/* PERF: libnfs's sync API polls the socket with rpc->poll_timeout (default 100 ms,
