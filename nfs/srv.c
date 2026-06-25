@@ -369,8 +369,19 @@ static struct nfs_context *nfs_makeContext(int version)
 	 * reads (HW-validated: `ls /` now complete, reads OK). As a VFS server we
 	 * re-lookup per mt op anyway, so caching dir entries here only risks staleness.
 	 * NOTE: this does NOT fix the separate first-lookup-after-psh transient ENOENT
-	 * (still reproduces with the cache off) — that is a different cause (likely
-	 * first-RPC/mount-settle timing right after takeover), tracked under #156. */
+	 * (still reproduces with the cache off) — and it is NOT a cache issue at all.
+	 * Root-caused #156: it is the takeover WINDOW. plo launches psh as a sibling
+	 * of this takeover server (user.plo.yaml) and does not gate on takeover
+	 * completion, so the first client commands run while "/" is still the sparse
+	 * dummyfs RAM root, before this server's portRegister("/"). Proven by the
+	 * nfsroot UART logs: `ls /usr/bin` ENOENTs at the prompt BEFORE
+	 * "nfs-fs: registered / (takeover)" prints, then every access AFTER that line
+	 * succeeds first-try (lua-nfsroot.log lines 398-411). The takeover is gated on
+	 * the DHCP lease, so this server cannot register "/" before psh prompts — no
+	 * NFS-side change closes the window. Fixing it requires gating clients on
+	 * takeover (a plo/boot-order change, out of this server's scope). Orchestrator
+	 * workaround: send no command until "registered / (takeover)" appears. See
+	 * docs/inprogress/2026-06-25-nfs-156-first-read.md. */
 	nfs_set_dircache(nfs, 0);
 	return nfs;
 }
