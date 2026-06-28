@@ -571,6 +571,33 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 		LOG("re-bind /dev: devfs port not found (devfs at /dev will be empty)\n");
 	}
 
+	/* Re-bind /tmp onto a RAM-backed dummyfs, IN-PROCESS, before we become "/"
+	 * (mirrors the /dev re-bind above). The NFS root cannot host AF_UNIX socket
+	 * special files, so X11's listening socket /tmp/.X11-unix/X0 fails to bind
+	 * on an NFS-backed /tmp. The boot script launches a named "tmpfs" dummyfs
+	 * port pre-takeover (dummyfs-tmp;-N;tmpfs); splicing it onto OUR /tmp node
+	 * gives X (and pipes/scratch) a writable RAM filesystem. An external
+	 * `dummyfs -m /tmp` does NOT work here: its mtSetAttr(atDev) splice onto an
+	 * NFS-owned dir is not honored, the same way the root splice falls through
+	 * to portRegister below. Non-fatal: a missing tmpfs leaves /tmp on NFS but
+	 * never bricks the boot. (#44/#45) */
+	oid_t tmpfsOid;
+	if (lookup("tmpfs", NULL, &tmpfsOid) == 0) {
+		(void)nfs_mkdir2(common.fs.nfs, "/tmp", 01777);
+		nfs_node_t *tmpNode = nfs_node_get(&common.fs.nodes, "/tmp");
+		if (tmpNode != NULL) {
+			tmpNode->type = otDir;
+			tmpNode->mnt = tmpfsOid;
+			LOG("re-bound /tmp (takeover, tmpfs port=%u)\n", tmpfsOid.port);
+		}
+		else {
+			LOG("re-bind /tmp: node alloc failed (/tmp stays on NFS)\n");
+		}
+	}
+	else {
+		LOG("re-bind /tmp: tmpfs port not found (/tmp stays on NFS)\n");
+	}
+
 	/* Start serving BEFORE the takeover so the new "/" answers lookups the
 	 * instant it is installed (no window where "/" resolves to a dead port). */
 	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
