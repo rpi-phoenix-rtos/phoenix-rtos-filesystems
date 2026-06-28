@@ -580,9 +580,15 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	 * `dummyfs -m /tmp` does NOT work here: its mtSetAttr(atDev) splice onto an
 	 * NFS-owned dir is not honored, the same way the root splice falls through
 	 * to portRegister below. Non-fatal: a missing tmpfs leaves /tmp on NFS but
-	 * never bricks the boot. (#44/#45) */
+	 * never bricks the boot. (#44/#45)
+	 *
+	 * Resolve the tmpfs backing via the /ramtmp mountpoint first (the boot
+	 * script does bind;tmpfs;/ramtmp, so /ramtmp resolves reliably like /dev),
+	 * and only fall back to the bare "tmpfs" name: a named port that is merely
+	 * registered but never mounted is not reliably resolvable by this late
+	 * lookup() — devfs survives only because bind;devfs;/dev references it. */
 	oid_t tmpfsOid;
-	if (lookup("tmpfs", NULL, &tmpfsOid) == 0) {
+	if ((lookup("/ramtmp", NULL, &tmpfsOid) == 0) || (lookup("tmpfs", NULL, &tmpfsOid) == 0)) {
 		(void)nfs_mkdir2(common.fs.nfs, "/tmp", 01777);
 		nfs_node_t *tmpNode = nfs_node_get(&common.fs.nodes, "/tmp");
 		if (tmpNode != NULL) {
