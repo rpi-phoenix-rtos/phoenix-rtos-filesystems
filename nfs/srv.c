@@ -4,7 +4,7 @@
  * A dummyfs-shaped userspace VFS server whose backing store is an NFS export
  * reached over the network via libnfs (the T0 port). It waits for a DHCP
  * lease, mounts the export, then splices itself under an existing directory
- * (e.g. /nfstest) via the mtSetAttr(atDev) mechanism — the same path the ia32
+ * (e.g. /mnt) via the mtSetAttr(atDev) mechanism — the same path the ia32
  * `dummyfs -m /tmp` mount and the ext2 SD-root use. It does NOT register "/"
  * (that is T3, the rootfs case).
  *
@@ -14,7 +14,7 @@
  * libnfs sync -> XDR -> socket-to-lwip is deeper than ext2-over-SD).
  *
  * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4] [root|takeover]
- *   defaults:   nfs /nfstest 10.42.0.1 / v4
+ *   defaults:   nfs /mnt 10.42.0.1 / v4
  *
  * Root mode (a trailing "root" token, #153 T3): the NFS export becomes "/"
  * itself, registered BEFORE any RAM "/" exists. The server accepts "/" as the
@@ -27,10 +27,10 @@
  * Takeover mode (a trailing "takeover" token, #153 T3 design-A): the NFS
  * export becomes "/", but AFTER a normal dummyfs RAM "/" + /dev bind + lwip
  * have come up. Because "/" already exists, sockets resolve normally and we
- * reuse the SAME proven subtree path as the /nfstest mount: the normal
+ * reuse the SAME proven subtree path as the /mnt mount: the normal
  * /dev/ifstatus DHCP-wait, then nfs_makeContext + nfs_mount. We then TAKE OVER
  * "/": first try the mtSetAttr(atDev) splice onto the "/" oid (the same
- * mechanism the /nfstest mount uses), re-resolve "/" to see whether the kernel
+ * mechanism the /mnt mount uses), re-resolve "/" to see whether the kernel
  * honored it, and if not fall back to portUnregister("/") + portRegister("/").
  * Example: nfs / 10.42.0.1 / v4 takeover.
  *
@@ -485,7 +485,7 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
  *
  * Takeover mechanism + the runtime decision between the two paths:
  *   1. Resolve the current "/" oid (the dummyfs root) and try the mtSetAttr
- *      (atDev) splice onto it — the same splice the /nfstest mount uses, just
+ *      (atDev) splice onto it — the same splice the /mnt mount uses, just
  *      targeting "/". Then re-resolve "/": if it now points at OUR port the
  *      splice took, log "via splice". (In practice the kernel returns the
  *      registered rootOid for a bare "/" lookup without consulting the root
@@ -676,7 +676,7 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 
 int main(int argc, char **argv)
 {
-	const char *mountpt = (argc > 1) ? argv[1] : "/nfstest";
+	const char *mountpt = (argc > 1) ? argv[1] : "/mnt";
 	const char *server = (argc > 2) ? argv[2] : "10.42.0.1";
 	const char *export = (argc > 3) ? argv[3] : "/";
 	const char *verstr = (argc > 4) ? argv[4] : "v4";
@@ -700,7 +700,7 @@ int main(int argc, char **argv)
 	}
 
 	if (mountpt[0] != '/' || strcmp(mountpt, "/") == 0) {
-		LOG("refusing to register '/' (that is the root case — pass the trailing 'root' token); give a subtree like /nfstest\n");
+		LOG("refusing to register '/' (that is the root case — pass the trailing 'root' token); give a subtree like /mnt\n");
 		return 1;
 	}
 
