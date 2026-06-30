@@ -66,6 +66,26 @@ typedef struct {
 	/* Filesystem objects */
 	ext2_obj_t *root;  /* Root object */
 	ext2_objs_t *objs; /* Filesystem objects */
+
+	/*
+	 * Filesystem-wide serialization lock.
+	 *
+	 * The block/inode allocators (block.c, inode.c) mutate fs-global state -
+	 * the on-disk block/inode bitmaps, the in-memory group descriptor table
+	 * (fs->gdt) and the superblock free counts (fs->sb) - with a non-atomic
+	 * read-bitmap / toggle-bit / write-bitmap / update-counts sequence. With
+	 * more than one worker thread these sequences interleave and corrupt the
+	 * shared counts and bitmaps. This lock serializes whole filesystem
+	 * operations so those sequences run to completion atomically.
+	 *
+	 * Lock ordering (acquire order, outermost first):
+	 *     lock  >  {obj->lock, objs->lock}  >  storage block-layer lock
+	 * It is acquired only at the libext2_* entry points (libext2.c), which
+	 * never call one another, so it is always the outermost lock and is never
+	 * re-acquired on the same thread (the mutex is non-recursive). This makes
+	 * the order trivially consistent and deadlock-free.
+	 */
+	handle_t lock;
 } ext2_t;
 
 

@@ -65,8 +65,17 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 
 	size_t namelen = strlen(name);
 
+	/*
+	 * Whole-operation fs lock (see ext2_t::lock). libext2_create is a
+	 * libext2_* entry point and never calls another libext2_* function, so
+	 * this lock is always outermost and never re-entered on the same thread.
+	 * Every return below must release it.
+	 */
+	mutexLock(fs->lock);
+
 	if (ext2_lookup(fs, dir->id, name, namelen, oid, &devOther) > 0) {
 		if ((obj = ext2_obj_get(fs, oid->id)) == NULL) {
+			mutexUnlock(fs->lock);
 			return -EINVAL;
 		}
 
@@ -85,6 +94,7 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 
 				mutexUnlock(obj->lock);
 				ext2_obj_put(fs, obj);
+				mutexUnlock(fs->lock);
 				return ret;
 			}
 			else {
@@ -92,6 +102,7 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 				ext2_obj_put(fs, obj);
 
 				if (ext2_unlink(fs, dir->id, name, namelen) < 0) {
+					mutexUnlock(fs->lock);
 					return -EEXIST;
 				}
 			}
@@ -99,6 +110,7 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 		else {
 			mutexUnlock(obj->lock);
 			ext2_obj_put(fs, obj);
+			mutexUnlock(fs->lock);
 			return -EEXIST;
 		}
 	}
@@ -119,91 +131,191 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 		}
 	}
 
+	mutexUnlock(fs->lock);
+
 	return ret;
 }
 
 
 static int libext2_open(void *info, oid_t *oid)
 {
-	return ext2_open((ext2_t *)info, oid->id);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_open(fs, oid->id);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_close(void *info, oid_t *oid)
 {
-	return ext2_close((ext2_t *)info, oid->id);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_close(fs, oid->id);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static ssize_t libext2_read(void *info, oid_t *oid, off_t offs, void *data, size_t len)
 {
-	return ext2_read((ext2_t *)info, oid->id, offs, data, len);
+	ext2_t *fs = (ext2_t *)info;
+	ssize_t ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_read(fs, oid->id, offs, data, len);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static ssize_t libext2_write(void *info, oid_t *oid, off_t offs, const void *data, size_t len)
 {
-	return ext2_write((ext2_t *)info, oid->id, offs, data, len);
+	ext2_t *fs = (ext2_t *)info;
+	ssize_t ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_write(fs, oid->id, offs, data, len);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_setattr(void *info, oid_t *oid, int type, long long attr, const void *data, size_t len)
 {
-	return ext2_setattr((ext2_t *)info, oid->id, type, attr, data, len);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_setattr(fs, oid->id, type, attr, data, len);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_getattr(void *info, oid_t *oid, int type, long long *attr)
 {
-	return ext2_getattr((ext2_t *)info, oid->id, type, attr);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_getattr(fs, oid->id, type, attr);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_getattrAll(void *info, oid_t *oid, struct _attrAll *attrs)
 {
-	return ext2_getattrAll((ext2_t *)info, oid->id, attrs);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_getattrAll(fs, oid->id, attrs);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_truncate(void *info, oid_t *oid, size_t size)
 {
-	return ext2_truncate((ext2_t *)info, oid->id, size);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_truncate(fs, oid->id, size);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_destroy(void *info, oid_t *oid)
 {
-	return ext2_destroy((ext2_t *)info, oid->id);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_destroy(fs, oid->id);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_lookup(void *info, oid_t *oid, const char *name, oid_t *res, oid_t *dev, char *lnk, int lnksz)
 {
-	return ext2_lookup((ext2_t *)info, oid->id, name, strlen(name), res, dev);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_lookup(fs, oid->id, name, strlen(name), res, dev);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_link(void *info, oid_t *dir, const char *name, oid_t *oid)
 {
-	return ext2_link((ext2_t *)info, dir->id, name, strlen(name), oid->id);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_link(fs, dir->id, name, strlen(name), oid->id);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_unlink(void *info, oid_t *oid, const char *name)
 {
-	return ext2_unlink((ext2_t *)info, oid->id, name, strlen(name));
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_unlink(fs, oid->id, name, strlen(name));
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_readdir(void *info, oid_t *oid, off_t offs, struct dirent *dent, size_t size)
 {
-	return ext2_read((ext2_t *)info, oid->id, offs, (char *)dent, size);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_read(fs, oid->id, offs, (char *)dent, size);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 
 static int libext2_statfs(void *info, void *buf, size_t len)
 {
-	return ext2_statfs((ext2_t *)info, buf, len);
+	ext2_t *fs = (ext2_t *)info;
+	int ret;
+
+	mutexLock(fs->lock);
+	ret = ext2_statfs(fs, buf, len);
+	mutexUnlock(fs->lock);
+
+	return ret;
 }
 
 

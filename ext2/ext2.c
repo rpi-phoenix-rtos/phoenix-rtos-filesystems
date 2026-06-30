@@ -643,7 +643,7 @@ int ext2_statfs(ext2_t *fs, void *buf, size_t len)
 		return -EINVAL;
 	}
 
-	/* TODO: superblock access should be protected with a lock */
+	/* Superblock access is serialized by fs->lock, taken in libext2_statfs */
 	st->f_bsize = st->f_frsize = fs->blocksz;
 	st->f_blocks = sb->blocks;
 	st->f_bfree = sb->freeBlocks;

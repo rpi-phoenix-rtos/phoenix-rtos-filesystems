@@ -303,6 +303,8 @@ void ext2_objs_destroy(ext2_t *fs)
 
 	resourceDestroy(fs->objs->lock);
 	free(fs->objs);
+
+	resourceDestroy(fs->lock);
 }
 
 
@@ -329,6 +331,13 @@ int ext2_objs_init(ext2_t *fs)
 		return -ENOMEM;
 
 	if ((err = mutexCreate(&objs->lock)) < 0) {
+		free(objs);
+		return err;
+	}
+
+	/* Filesystem-wide allocator serialization lock (see ext2_t::lock) */
+	if ((err = mutexCreate(&fs->lock)) < 0) {
+		resourceDestroy(objs->lock);
 		free(objs);
 		return err;
 	}
