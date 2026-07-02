@@ -6,7 +6,15 @@
 # Copyright 2026 Phoenix Systems
 #
 
-# nfs: userspace NFS-client VFS server (#153). Links the libnfs port; only
-# built for this networked target (do not add unconditionally — a no-network
-# target would ship a dead binary that fails to link without libnfs.a).
-DEFAULT_COMPONENTS := dummyfs libext2 libjffs2 nfs
+# nfs (userspace NFS-client VFS server, #153) is intentionally NOT a default
+# component: it #includes <nfsc/libnfs.h> and links -lnfs, both supplied by the
+# libnfs PORT, which the build builds AFTER core (build.sh order: core -> ports
+# -> project). Listing nfs here made the core filesystems build require a
+# not-yet-built port, so a clean/cold-sysroot core build failed (masked on a
+# warm sysroot that still held a stale libnfs.a/header). Only the nfsroot
+# variant needs the nfs server, so it is built in the project stage instead —
+# see the aarch64a72-generic-rpi4b project's b_build_project, which runs
+# `make -C phoenix-rtos-filesystems nfs nfs-install` after ports for that
+# variant. The `nfs` target still exists here (defined by nfs/Makefile via the
+# ALL_MAKES glob), so that post-ports build resolves it.
+DEFAULT_COMPONENTS := dummyfs libext2 libjffs2
