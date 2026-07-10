@@ -216,18 +216,18 @@ int main(int argc, char **argv)
 		}
 	}
 
-        if (mountpt == NULL) {
-                portCreate(&port);
+	if (mountpt == NULL) {
+		portCreate(&port);
 
-                /* Try to mount fs as root */
-                if (portRegister(port, "/", &root) < 0) {
-                        LOG("can't mount as rootfs\n");
-                        return -1;
-                }
-        }
-        else {
-                if (non_fs_namespace) {
-                        portCreate(&port);
+		/* Try to mount fs as root */
+		if (portRegister(port, "/", &root) < 0) {
+			LOG("can't mount as rootfs\n");
+			return -1;
+		}
+	}
+	else {
+		if (non_fs_namespace) {
+			portCreate(&port);
 			if (portRegister(port, mountpt, &root) < 0) {
 				LOG("can't mount as %s\n", mountpt);
 				return -1;
@@ -235,10 +235,10 @@ int main(int argc, char **argv)
 
 			mountpt = NULL;
 		}
-                else {
-                        portCreate(&port);
-                }
-        }
+		else {
+			portCreate(&port);
+		}
+	}
 
 	root.port = port;
 	if (dummyfs_mount((void **)&ctx, mountpt, 0, &root) != EOK) {
