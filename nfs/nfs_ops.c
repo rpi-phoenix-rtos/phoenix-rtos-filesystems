@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <unistd.h>   /* usleep (transient-error retry backoff) */
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <phoenix/attribute.h>
@@ -58,10 +59,27 @@ static int nfs_typeFromMode(uint64_t mode)
 }
 
 
-/* Refresh a node's cached type via a don't-follow stat. Returns 0 or -errno. */
+/* Is this a transient RPC error worth retrying (connection reset / timeout)? A genuine
+ * missing entry (ENOENT) or other definite error is not. */
+static int nfs_transient(int rc)
+{
+	int e = nfs_err(rc);
+	return (e == -EIO) || (e == -ETIMEDOUT);
+}
+
+
+/* Refresh a node's cached type via a don't-follow stat. Returns 0 or -errno. Bounded retry on
+ * transient RPC errors (contributes to the intermittent exec -5: the mtOpen path stats first). */
 static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 {
-	int rc = nfs_lstat64(fs->nfs, n->path, st);
+	int rc = -EIO;
+	for (int tries = 0; tries < 10; tries++) {
+		rc = nfs_lstat64(fs->nfs, n->path, st);
+		if ((rc == 0) || !nfs_transient(rc)) {
+			break;
+		}
+		usleep(tries < 6 ? (10000u << tries) : 640000u);
+	}
 	if (rc != 0) {
 		return nfs_err(rc);
 	}
@@ -125,7 +143,21 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		}
 
 		struct nfs_stat_64 st;
-		int rc = nfs_lstat64(fs->nfs, child, &st);
+		/* Bounded retry on transient RPC errors (connection reset/timeout); a genuine missing
+		 * entry (ENOENT) breaks immediately. Otherwise a transient stat failure during path
+		 * resolution fails the whole open/exec (contributes to the intermittent exec -5). */
+		int rc = -EIO;
+		for (int tries = 0; tries < 10; tries++) {
+			rc = nfs_lstat64(fs->nfs, child, &st);
+			if (rc == 0) {
+				break;
+			}
+			int e = nfs_err(rc);
+			if (e != -EIO && e != -ETIMEDOUT) {
+				break;
+			}
+			usleep(tries < 6 ? (10000u << tries) : 640000u);
+		}
 		if (rc != 0) {
 			free(child);
 			/* Route through nfs_err so a transient RPC error (EIO/ESTALE/
@@ -213,8 +245,16 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 		struct nfsfh *fh = NULL;
 		rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
 		if (rc != 0) {
-			/* fall back to read-only (e.g. mode lacks write) */
-			rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+			/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
+			 * errors — this open is on the exec path, so a transient failure here is a prime
+			 * cause of the intermittent exec -5. */
+			for (int tries = 0; tries < 10; tries++) {
+				rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+				if ((rc == 0) || !nfs_transient(rc)) {
+					break;
+				}
+				usleep(tries < 6 ? (10000u << tries) : 640000u);
+			}
 			if (rc != 0) {
 				return nfs_err(rc);
 			}
@@ -289,18 +329,46 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 		return -EISDIR;
 	}
 
-	/* Regular file: use the cached fh, else open-on-demand by path. */
+	/* Regular file: use the cached fh, else open-on-demand by path (bounded retry on transient
+	 * RPC errors, same rationale as the read below). */
 	struct nfsfh *fh = n->fh;
 	int owned = 0;
 	if (fh == NULL) {
-		int rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+		int rc = -EIO;
+		for (int tries = 0; tries < 10; tries++) {
+			rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+			if (rc == 0) {
+				break;
+			}
+			int e = nfs_err(rc);
+			if (e != -EIO && e != -ETIMEDOUT) {
+				break;
+			}
+			usleep(tries < 6 ? (10000u << tries) : 640000u);
+		}
 		if (rc != 0) {
 			return nfs_err(rc);
 		}
 		owned = 1;
 	}
 
-	int rc = nfs_pread(fs->nfs, fh, buf, len, offs);
+	/* Bounded retry on transient RPC errors. A single connection reset / timeout mid-transfer
+	 * otherwise fails the whole read; for exec-over-NFS of a large binary (17MB rpi4-quake =
+	 * thousands of demand-paged reads) that surfaced as an intermittent `exec ... failed (-5)`.
+	 * libnfs reconnects on the next call, so retry with backoff. Non-transient errors (ENOENT,
+	 * EISDIR, ...) break immediately. */
+	int rc = -EIO;
+	for (int tries = 0; tries < 10; tries++) {
+		rc = nfs_pread(fs->nfs, fh, buf, len, offs);
+		if (rc >= 0) {
+			break;
+		}
+		int e = nfs_err(rc);
+		if (e != -EIO && e != -ETIMEDOUT) {
+			break;
+		}
+		usleep(tries < 6 ? (10000u << tries) : 640000u);   /* 10,20,40,80,160,320,640ms... */
+	}
 
 	if (owned != 0) {
 		nfs_close(fs->nfs, fh);
