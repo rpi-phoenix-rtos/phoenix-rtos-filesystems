@@ -73,7 +73,7 @@ static int nfs_transient(int rc)
 static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 {
 	int rc = -EIO;
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0; tries < 25; tries++) {
 		rc = nfs_lstat64(fs->nfs, n->path, st);
 		if ((rc == 0) || !nfs_transient(rc)) {
 			break;
@@ -147,7 +147,7 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		 * entry (ENOENT) breaks immediately. Otherwise a transient stat failure during path
 		 * resolution fails the whole open/exec (contributes to the intermittent exec -5). */
 		int rc = -EIO;
-		for (int tries = 0; tries < 10; tries++) {
+		for (int tries = 0; tries < 25; tries++) {
 			rc = nfs_lstat64(fs->nfs, child, &st);
 			if (rc == 0) {
 				break;
@@ -248,7 +248,7 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 			/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
 			 * errors — this open is on the exec path, so a transient failure here is a prime
 			 * cause of the intermittent exec -5. */
-			for (int tries = 0; tries < 10; tries++) {
+			for (int tries = 0; tries < 25; tries++) {
 				rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
 				if ((rc == 0) || !nfs_transient(rc)) {
 					break;
@@ -335,7 +335,7 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 	int owned = 0;
 	if (fh == NULL) {
 		int rc = -EIO;
-		for (int tries = 0; tries < 10; tries++) {
+		for (int tries = 0; tries < 25; tries++) {
 			rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
 			if (rc == 0) {
 				break;
@@ -358,7 +358,7 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 	 * libnfs reconnects on the next call, so retry with backoff. Non-transient errors (ENOENT,
 	 * EISDIR, ...) break immediately. */
 	int rc = -EIO;
-	for (int tries = 0; tries < 10; tries++) {
+	for (int tries = 0; tries < 25; tries++) {
 		rc = nfs_pread(fs->nfs, fh, buf, len, offs);
 		if (rc >= 0) {
 			break;
