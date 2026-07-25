@@ -511,16 +511,40 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	}
 	LOG("takeover: interface bound, ip=%s\n", ipbuf);
 
-	common.fs.nfs = nfs_makeContext(version);
-	if (common.fs.nfs == NULL) {
-		LOG("takeover aborted: nfs_init_context failed; keeping RAM root /\n");
-		return 3;
-	}
+	/* Bounded-retry the makeContext+mount (mirrors nfs_runRoot's loop). A SINGLE
+	 * attempt right after the DHCP lease lands can hit a transient: the socketsrv /
+	 * lwip socket layer is not always ready the instant DHCP completes, so the first
+	 * mount RPC (or even nfs_init_context's socket open) can fail even though the host
+	 * export is perfectly healthy. The old single-shot path aborted the ENTIRE takeover
+	 * on that transient, dropping the boot to the sparse RAM root — so Quake and
+	 * everything else on the NFS root became unavailable (observed: intermittent
+	 * "takeover aborted: mount 10.42.0.1:/" on ~some cold boots). Retry with a backoff
+	 * until a deadline instead; the host export being down is not the case here, so a
+	 * bounded retry converges quickly (usually attempt 0 or 1). */
+	{
+		const int deadline_s = 120; /* margin past the ~90s NFSv4 lease window on a rapid reboot */
+		time_t start = time(NULL);
+		int attempt = 0;
+		for (;;) {
+			common.fs.nfs = nfs_makeContext(version);
+			if (common.fs.nfs != NULL) {
+				if (nfs_mount(common.fs.nfs, server, export) == 0)
+					break;
+				LOG("takeover mount attempt %d failed: %s\n", attempt, nfs_get_error(common.fs.nfs));
+				nfs_destroy_context(common.fs.nfs);
+				common.fs.nfs = NULL;
+			}
+			else {
+				LOG("takeover mount attempt %d: nfs_init_context returned NULL\n", attempt);
+			}
 
-	if (nfs_mount(common.fs.nfs, server, export) != 0) {
-		LOG("takeover aborted: mount %s:%s: %s; keeping RAM root /\n", server, export, nfs_get_error(common.fs.nfs));
-		nfs_destroy_context(common.fs.nfs);
-		return 4;
+			if ((time(NULL) - start) >= deadline_s) {
+				LOG("takeover aborted: mount %s:%s failed after %ds; keeping RAM root /\n", server, export, deadline_s);
+				return 4;
+			}
+			attempt++;
+			usleep(3000000); /* 3 s inter-attempt backoff (matches root mode) */
+		}
 	}
 	/* Same marker the subtree mount prints — the orchestrator reads this first:
 	 * it proves sockets work with a dummyfs "/" up (the design-A premise). */
