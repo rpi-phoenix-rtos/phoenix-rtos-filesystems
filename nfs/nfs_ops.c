@@ -88,6 +88,101 @@ static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 }
 
 
+/* Bounded client-state reclaims per operation. An NFSv4 lease/state expiry is
+ * recovered by rebuilding the client (nfs_reclaim); this caps how many times a
+ * single op will do so before giving up, so a genuinely dead server still errors
+ * out promptly rather than looping. */
+#define NFS_RECLAIM_MAX 2
+
+
+/* Does rc indicate the server has discarded our NFSv4 client state (idle lease
+ * lapse, server restart, or accumulated stale state across rapid reboots)?
+ *
+ * libnfs's check_nfs4_error maps NFSv4 status codes through the NFSv3 errno
+ * table (nfs_v4.c), which has no entry for the v4-only state codes, so they all
+ * surface as -ERANGE with the real status preserved only in the error string.
+ * We therefore match the status name in nfs_get_error() to tell a recoverable
+ * expiry apart from a genuine -ERANGE (NFS3ERR_DQUOT). Only meaningful when rc is
+ * an error and the string was set by this very call (all these ops call
+ * nfs_set_error on failure), so gate on rc < 0. */
+static int nfs_isStateExpiry(nfs_fs_t *fs, int rc)
+{
+	if (rc >= 0) {
+		return 0;
+	}
+	const char *e = nfs_get_error(fs->nfs);
+	if (e == NULL) {
+		return 0;
+	}
+	return (strstr(e, "NFS4ERR_EXPIRED") != NULL) ||
+		(strstr(e, "NFS4ERR_STALE_CLIENTID") != NULL) ||
+		(strstr(e, "NFS4ERR_STALE_STATEID") != NULL) ||
+		(strstr(e, "NFS4ERR_BAD_STATEID") != NULL);
+}
+
+
+/* Re-establish NFSv4 client state after an expiry. Rebuild the libnfs context
+ * from scratch: nfs_mount re-runs SETCLIENTID + SETCLIENTID_CONFIRM (the RFC 7530
+ * reclaim), using our stable client name so the server REPLACES the lapsed state
+ * rather than accumulating a second incarnation. Every cached filehandle belonged
+ * to the old context (freed by nfs_destroy_context) and its open stateid is dead,
+ * so they are all invalidated; the id<->path table is untouched and each retried
+ * op re-opens by path. Runs on the loop thread (no concurrent libnfs access).
+ * Returns 0 on success, -errno on failure (the old context is kept on failure so
+ * the caller can still surface the original error). */
+static int nfs_reclaim(nfs_fs_t *fs)
+{
+	struct nfs_context *fresh = nfs_makeContext(fs->version);
+	if (fresh == NULL) {
+		return -ENOMEM;
+	}
+
+	if (nfs_mount(fresh, fs->server, fs->export) != 0) {
+		printf("nfs-fs: reclaim re-mount %s:%s failed: %s\n", fs->server, fs->export, nfs_get_error(fresh));
+		nfs_destroy_context(fresh);
+		return -EIO;
+	}
+
+	struct nfs_context *old = fs->nfs;
+	fs->nfs = fresh;
+	nfs_node_invalidateHandles(&fs->nodes);
+	nfs_destroy_context(old);
+
+	printf("nfs-fs: reclaimed NFSv4 client state (re-mounted %s:%s)\n", fs->server, fs->export);
+	return 0;
+}
+
+
+/* If rc is a recoverable NFSv4 state expiry and reclaim budget remains, rebuild
+ * the client and return 1 (caller should retry the op); otherwise return 0. */
+static int nfs_tryReclaim(nfs_fs_t *fs, int rc, int *budget)
+{
+	if ((*budget <= 0) || (nfs_isStateExpiry(fs, rc) == 0)) {
+		return 0;
+	}
+	(*budget)--;
+	return (nfs_reclaim(fs) == 0) ? 1 : 0;
+}
+
+
+int nfs_ops_renew(nfs_fs_t *fs)
+{
+	int rc = nfs_renew(fs->nfs);
+	if (rc == 0) {
+		return 0;
+	}
+
+	/* Renew failed. If the lease has already lapsed, reclaim now so the next
+	 * open() doesn't have to; any other (e.g. transient) failure is left for the
+	 * next tick / the per-op reclaim safety net. */
+	if (nfs_isStateExpiry(fs, rc) != 0) {
+		printf("nfs-fs: renew found lease expired, reclaiming\n");
+		return nfs_reclaim(fs);
+	}
+	return rc;
+}
+
+
 int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t *dev)
 {
 	nfs_node_t *d;
@@ -242,22 +337,31 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 
 	/* Directories and symlinks are handled by path-based ops, not an fh. */
 	if ((n->type == otFile) && (n->fh == NULL)) {
+		int reclaimBudget = NFS_RECLAIM_MAX;
 		struct nfsfh *fh = NULL;
-		rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
-		if (rc != 0) {
-			/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
-			 * errors — this open is on the exec path, so a transient failure here is a prime
-			 * cause of the intermittent exec -5. */
-			for (int tries = 0; tries < 25; tries++) {
-				rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
-				if ((rc == 0) || !nfs_transient(rc)) {
-					break;
-				}
-				usleep(tries < 6 ? (10000u << tries) : 640000u);
-			}
+		for (;;) {
+			rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
 			if (rc != 0) {
-				return nfs_err(rc);
+				/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
+				 * errors — this open is on the exec path, so a transient failure here is a prime
+				 * cause of the intermittent exec -5. */
+				for (int tries = 0; tries < 25; tries++) {
+					rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+					if ((rc == 0) || !nfs_transient(rc)) {
+						break;
+					}
+					usleep(tries < 6 ? (10000u << tries) : 640000u);
+				}
 			}
+			if (rc == 0) {
+				break;
+			}
+			/* NFSv4 client state expired (idle lease lapse / server state loss):
+			 * re-establish it and retry the open. */
+			if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
+				continue;
+			}
+			return nfs_err(rc);
 		}
 		n->fh = fh;
 	}
@@ -329,55 +433,77 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 		return -EISDIR;
 	}
 
-	/* Regular file: use the cached fh, else open-on-demand by path (bounded retry on transient
-	 * RPC errors, same rationale as the read below). */
-	struct nfsfh *fh = n->fh;
-	int owned = 0;
-	if (fh == NULL) {
+	/* Regular file. Wrap "ensure an fh + read" in a reclaim loop: an NFSv4
+	 * lease/state expiry (idle >~90s, or server state loss) surfaces here — the
+	 * exec loader demand-pages a binary in through this path, so a cached open
+	 * stateid can die between pages. On expiry we re-establish client state and
+	 * retry; the read itself is otherwise unchanged. */
+	int reclaimBudget = NFS_RECLAIM_MAX;
+	for (;;) {
+		struct nfsfh *fh = n->fh;
+		int owned = 0;
+		if (fh == NULL) {
+			/* Open-on-demand by path (bounded retry on transient RPC errors, same
+			 * rationale as the read below). */
+			int rc = -EIO;
+			for (int tries = 0; tries < 25; tries++) {
+				rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
+				if (rc == 0) {
+					break;
+				}
+				int e = nfs_err(rc);
+				if (e != -EIO && e != -ETIMEDOUT) {
+					break;
+				}
+				usleep(tries < 6 ? (10000u << tries) : 640000u);
+			}
+			if (rc != 0) {
+				if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
+					continue;
+				}
+				return nfs_err(rc);
+			}
+			owned = 1;
+		}
+
+		/* Bounded retry on transient RPC errors. A single connection reset / timeout mid-transfer
+		 * otherwise fails the whole read; for exec-over-NFS of a large binary (17MB rpi4-quake =
+		 * thousands of demand-paged reads) that surfaced as an intermittent `exec ... failed (-5)`.
+		 * libnfs reconnects on the next call, so retry with backoff. Non-transient errors (ENOENT,
+		 * EISDIR, ...) break immediately. */
 		int rc = -EIO;
 		for (int tries = 0; tries < 25; tries++) {
-			rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
-			if (rc == 0) {
+			rc = nfs_pread(fs->nfs, fh, buf, len, offs);
+			if (rc >= 0) {
 				break;
 			}
 			int e = nfs_err(rc);
 			if (e != -EIO && e != -ETIMEDOUT) {
 				break;
 			}
-			usleep(tries < 6 ? (10000u << tries) : 640000u);
+			usleep(tries < 6 ? (10000u << tries) : 640000u);   /* 10,20,40,80,160,320,640ms... */
 		}
-		if (rc != 0) {
-			return nfs_err(rc);
-		}
-		owned = 1;
-	}
 
-	/* Bounded retry on transient RPC errors. A single connection reset / timeout mid-transfer
-	 * otherwise fails the whole read; for exec-over-NFS of a large binary (17MB rpi4-quake =
-	 * thousands of demand-paged reads) that surfaced as an intermittent `exec ... failed (-5)`.
-	 * libnfs reconnects on the next call, so retry with backoff. Non-transient errors (ENOENT,
-	 * EISDIR, ...) break immediately. */
-	int rc = -EIO;
-	for (int tries = 0; tries < 25; tries++) {
-		rc = nfs_pread(fs->nfs, fh, buf, len, offs);
 		if (rc >= 0) {
-			break;
+			if (owned != 0) {
+				nfs_close(fs->nfs, fh);
+			}
+			return rc;
 		}
-		int e = nfs_err(rc);
-		if (e != -EIO && e != -ETIMEDOUT) {
-			break;
+
+		/* Read failed. If the client state expired, reclaim and retry: do NOT
+		 * nfs_close(fh) here — on expiry the fh is dead and reclaim destroys the
+		 * whole context (freeing it); a cached n->fh is invalidated by reclaim so
+		 * the next pass re-opens by path. */
+		if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
+			continue;
 		}
-		usleep(tries < 6 ? (10000u << tries) : 640000u);   /* 10,20,40,80,160,320,640ms... */
-	}
 
-	if (owned != 0) {
-		nfs_close(fs->nfs, fh);
-	}
-
-	if (rc < 0) {
+		if (owned != 0) {
+			nfs_close(fs->nfs, fh);
+		}
 		return nfs_err(rc);
 	}
-	return rc;
 }
 
 
@@ -397,26 +523,42 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 		return -EISDIR;
 	}
 
-	struct nfsfh *fh = n->fh;
-	int owned = 0;
-	if (fh == NULL) {
-		int rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
-		if (rc != 0) {
-			return nfs_err(rc);
+	/* Reclaim loop (see nfs_ops_read): re-establish NFSv4 client state and retry
+	 * if the lease/state expired under us. */
+	int reclaimBudget = NFS_RECLAIM_MAX;
+	for (;;) {
+		struct nfsfh *fh = n->fh;
+		int owned = 0;
+		if (fh == NULL) {
+			int rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
+			if (rc != 0) {
+				if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
+					continue;
+				}
+				return nfs_err(rc);
+			}
+			owned = 1;
 		}
-		owned = 1;
-	}
 
-	int rc = nfs_pwrite(fs->nfs, fh, (void *)buf, len, offs);
+		int rc = nfs_pwrite(fs->nfs, fh, (void *)buf, len, offs);
 
-	if (owned != 0) {
-		nfs_close(fs->nfs, fh);
-	}
+		if (rc >= 0) {
+			if (owned != 0) {
+				nfs_close(fs->nfs, fh);
+			}
+			return rc;
+		}
 
-	if (rc < 0) {
+		/* On expiry, do not nfs_close(fh) — reclaim frees the whole context. */
+		if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
+			continue;
+		}
+
+		if (owned != 0) {
+			nfs_close(fs->nfs, fh);
+		}
 		return nfs_err(rc);
 	}
-	return rc;
 }
 
 

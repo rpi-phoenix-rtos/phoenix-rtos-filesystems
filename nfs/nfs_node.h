@@ -91,6 +91,13 @@ extern void nfs_node_idleUnlink(nfs_nodeTree_t *t, nfs_node_t *n);
  * Does not unlink it — the caller nfs_close()s the fh then idleUnlinks. */
 extern nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t);
 
+/* Drop every cached filehandle and reset the idle LRU, structurally (no
+ * nfs_close). Used by the NFSv4 state-expiry reclaim (nfs_ops.c): after the
+ * libnfs context is rebuilt, all previously cached fhs belong to the destroyed
+ * context and their open stateids are dead, so they must be forgotten. The
+ * id<->path table is preserved (paths are stable). */
+extern void nfs_node_invalidateHandles(nfs_nodeTree_t *t);
+
 /* Join a parent directory path and a single name component into a freshly
  * malloc'd canonical export-relative path. Caller frees. Returns NULL on OOM. */
 extern char *nfs_node_joinPath(const char *parent, const char *name);

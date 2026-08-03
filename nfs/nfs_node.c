@@ -199,6 +199,32 @@ nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t)
 }
 
 
+void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
+{
+	if (t->byId.root == NULL) {
+		return;
+	}
+
+	/* Walk every node and drop its cached filehandle. The libnfs context that
+	 * owned these fhs has been destroyed (nfs_reclaim), so the pointers dangle
+	 * and their NFSv4 open stateids are dead; we must NOT nfs_close them (the
+	 * owning context is gone). This is structural only — the id<->path table is
+	 * left intact (paths are stable), so each subsequent op re-opens by path. */
+	for (rbnode_t *it = lib_rbMinimum(t->byId.root); it != NULL; it = lib_rbNext(it)) {
+		nfs_node_t *n = lib_treeof(nfs_node_t, idLinkage, it);
+		n->fh = NULL;
+		n->idle = 0;
+		n->idleNext = NULL;
+		n->idlePrev = NULL;
+	}
+
+	/* The idle LRU referenced the now-invalidated fhs; reset it wholesale. */
+	t->idleHead = NULL;
+	t->idleTail = NULL;
+	t->idleCount = 0;
+}
+
+
 char *nfs_node_joinPath(const char *parent, const char *name)
 {
 	size_t plen = strlen(parent);

@@ -11,7 +11,10 @@
  * Single-threaded: the libnfs sync API drives one msgRecv loop. The loop and
  * the async splice both run on explicitly-sized >=64 KB stacks (the #120
  * pool-thread-stack-overflow lesson: the NFS call chain msgRecv -> handler ->
- * libnfs sync -> XDR -> socket-to-lwip is deeper than ext2-over-SD).
+ * libnfs sync -> XDR -> socket-to-lwip is deeper than ext2-over-SD). A small
+ * renew helper thread also runs, but it never touches libnfs: it self-sends an
+ * NFS_MSG_RENEW message so the periodic NFSv4 lease keepalive executes on the
+ * loop thread, keeping libnfs single-threaded (its own stack is therefore tiny).
  *
  * Usage (argv): nfs <mountpoint> [server-ip] [export] [v3|v4] [root|takeover]
  *   defaults:   nfs /mnt 10.42.0.1 / v4
@@ -69,12 +72,26 @@
  * default pool-thread stack (#120). Applies to BOTH the loop and the splice. */
 #define NFS_STACKSZ (16 * _PAGE_SIZE)
 
+/* The renew helper thread only sleeps and msgSends (the actual libnfs RENEW runs
+ * on the loop thread), so a small stack is plenty. */
+#define NFS_RENEW_STACKSZ (2 * _PAGE_SIZE)
+
+/* NFSv4 lease keepalive cadence. The server lease is ~90 s (Linux nfsd default);
+ * renew well inside it so an idle client never lets the lease lapse. */
+#define NFS_RENEW_SECS 45
+
+/* Private message type used only between the renew helper thread and this
+ * server's own loop (self-send). It is never emitted by the kernel VFS, which
+ * uses mtOpen..mtReaddir and mtStat — so no collision with a real request. */
+#define NFS_MSG_RENEW 0x6e667372 /* 'nfsr' */
+
 
 static struct {
 	nfs_fs_t fs;
 	const char *mountpt;
 	char __attribute__((aligned(8))) loopStack[NFS_STACKSZ];
 	char __attribute__((aligned(8))) mountStack[NFS_STACKSZ];
+	char __attribute__((aligned(8))) renewStack[NFS_RENEW_STACKSZ];
 } common;
 
 
@@ -315,6 +332,12 @@ static void nfs_loopThread(void *arg)
 				msg.o.err = nfs_ops_statfs(fs, msg.o.data, msg.o.size);
 				break;
 
+			case NFS_MSG_RENEW:
+				/* Self-sent lease keepalive tick (nfs_renewThread). Runs the RENEW
+				 * on this loop thread so libnfs stays single-threaded. */
+				msg.o.err = nfs_ops_renew(fs);
+				break;
+
 			default:
 				msg.o.err = -EINVAL;
 				break;
@@ -325,10 +348,36 @@ static void nfs_loopThread(void *arg)
 }
 
 
+/* NFSv4 lease keepalive (prevention half of the expiry fix). libnfs sends no
+ * RENEW, so an idle client's ~90 s lease lapses and the next OPEN fails with
+ * NFS4ERR_EXPIRED — recovered by nfs_ops.c's reclaim, but at the cost of a
+ * re-mount hiccup and churned server-side state. This thread wakes on a fixed
+ * cadence and asks the loop to renew.
+ *
+ * It does NOT touch the libnfs context itself: that is only ever driven by the
+ * single msgRecv loop thread. It self-sends an NFS_MSG_RENEW message to our own
+ * port, which the loop handles inline (nfs_ops_renew) like any other request, so
+ * renewal stays serialized with the request path with no lock and no concurrent
+ * libnfs access. The renew result rides back in the reply; a failure is
+ * non-fatal (the per-op reclaim path is the safety net), so it is not acted on
+ * here beyond what nfs_ops_renew already does. */
+static void nfs_renewThread(void *arg)
+{
+	(void)arg;
+	for (;;) {
+		sleep(NFS_RENEW_SECS);
+		msg_t msg = { 0 };
+		msg.type = NFS_MSG_RENEW;
+		(void)msgSend(common.fs.port, &msg);
+	}
+}
+
+
 /* (Re-)create a libnfs context with our fixed transfer parameters. Used by the
- * root-mode bounded-retry loop, which throws away and rebuilds the context on
- * each failed mount attempt. */
-static struct nfs_context *nfs_makeContext(int version)
+ * root-mode bounded-retry loop (which throws away and rebuilds the context on
+ * each failed mount attempt) and by the NFSv4 state-expiry reclaim in nfs_ops.c
+ * (declared in nfs_ops.h so the rebuild uses identical tuning). */
+struct nfs_context *nfs_makeContext(int version)
 {
 	struct nfs_context *nfs = nfs_init_context();
 	if (nfs == NULL) {
@@ -469,6 +518,9 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 	/* Run the message loop on its own >=64 KB stack (the primary stack may be
 	 * the 8 KB default). No splice thread in root mode. */
 	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
+
+	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
+	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
 
 	for (;;) {
 		usleep(1000000);
@@ -632,6 +684,9 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	 * instant it is installed (no window where "/" resolves to a dead port). */
 	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
 
+	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
+	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
+
 	/* Path 1: try the proven mtSetAttr(atDev) splice onto the existing "/". */
 	oid_t oldRoot;
 	int tookOver = 0;
@@ -712,6 +767,13 @@ int main(int argc, char **argv)
 
 	int version = (strcmp(verstr, "v3") == 0) ? NFS_V3 : NFS_V4;
 
+	/* Capture the mount parameters so the loop thread can rebuild the libnfs
+	 * context after an NFSv4 lease/state expiry (nfs_ops.c reclaim). server/export
+	 * point into argv, which lives for the whole process. */
+	common.fs.server = server;
+	common.fs.export = export;
+	common.fs.version = version;
+
 	LOG("start (mountpt=%s server=%s export=%s %s%s%s)\n", mountpt, server, export, verstr,
 		rootMode ? " root" : "", takeoverMode ? " takeover" : "");
 
@@ -770,6 +832,9 @@ int main(int argc, char **argv)
 	 * the 8 KB default). */
 	LOG("initialized\n");
 	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
+
+	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
+	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
 
 	/* The two worker threads run forever; park the main thread. */
 	for (;;) {
