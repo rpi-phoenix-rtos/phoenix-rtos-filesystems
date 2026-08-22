@@ -918,12 +918,45 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		return nfs_err(rc);
 	}
 
-	off_t diroffs = 0;
 	struct nfsdirent *ent;
 	int emitted = -ENOENT;
 
+	/* POSIX readdir must return "." and ".." — NFS READDIR (via libnfs) does not
+	 * include them, so synthesize them as the first two entries (matching dummyfs).
+	 * With the cumulative-name-length cookie ("."=1, ".."=2) they consume cookie
+	 * slots 0 and 1, so the libnfs entries below start at diroffs 3. */
+	if ((offs == 0) || (offs == 1)) {
+		const char *dot = (offs == 0) ? "." : "..";
+		size_t namelen = (offs == 0) ? 1 : 2;
+		/* Resolve the real NFS inode so "." (this dir) and ".." (its parent) carry
+		 * correct, mutually-distinct inode numbers (the server resolves the trailing
+		 * ".." for us) rather than both reusing d->id. Fall back to d->id on error. */
+		ino_t ino = (ino_t)d->id;
+		struct nfs_stat_64 st;
+		char qpath[512];
+		int qn = (offs == 0) ? snprintf(qpath, sizeof(qpath), "%s", d->path)
+		                     : snprintf(qpath, sizeof(qpath), "%s/..", d->path);
+		if ((qn > 0) && ((size_t)qn < sizeof(qpath)) && (nfs_lstat64(fs->nfs, qpath, &st) == 0)) {
+			ino = (ino_t)st.nfs_ino;
+		}
+		dent->d_ino = ino;
+		dent->d_reclen = (uint16_t)namelen;
+		dent->d_namlen = (uint16_t)namelen;
+		dent->d_type = otDir;
+		memcpy(dent->d_name, dot, namelen);
+		dent->d_name[namelen] = '\0';
+		nfs_closedir(fs->nfs, nfsdir);
+		return 0;
+	}
+
+	off_t diroffs = 3;
 	while ((ent = nfs_readdir(fs->nfs, nfsdir)) != NULL) {
 		size_t namelen = strlen(ent->name);
+
+		/* skip any server-provided "."/".." so the synthesized ones are not duplicated */
+		if ((ent->name[0] == '.') && ((namelen == 1) || ((namelen == 2) && (ent->name[1] == '.')))) {
+			continue;
+		}
 
 		if (diroffs >= offs) {
 			if ((sizeof(struct dirent) + namelen + 1) > size) {
