@@ -398,7 +398,6 @@ int nfs_ops_close(nfs_fs_t *fs, oid_t *oid)
 					lru->fh = NULL;
 				}
 				nfs_node_idleUnlink(&fs->nodes, lru);
-				printf("nfs-fs: fh-cache evict, %u idle\n", fs->nodes.idleCount);
 			}
 		}
 	}
