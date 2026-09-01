@@ -580,11 +580,13 @@ int nfs_ops_truncate(nfs_fs_t *fs, oid_t *oid, size_t size)
 }
 
 
-/* POSIX st_blocks is the number of 512-byte units actually allocated. libnfs
- * reports the preferred I/O block size (nfs_blksize) but not the allocated block
- * count (the server's SPACE_USED is not mapped), leaving nfs_blocks == 0, which
- * makes du(1)/ls -s report 0 for every file. Approximate it from the file size
- * when unavailable (exact for non-sparse files, the common case over NFS). */
+/* POSIX st_blocks is the number of 512-byte units actually allocated. Defensive
+ * fallback: if the server/libnfs does not report an allocated block count
+ * (nfs_blocks == 0, e.g. some exports) approximate it from the file size so
+ * du(1)/ls -s do not show 0. NOTE: when libnfs DOES report nfs_blocks it appears
+ * to be in the NFS block size (nfs_blksize, typically 4096) rather than 512-byte
+ * units, so du can under-report ~8x -- a separate fix (nfs_blocks * nfs_blksize /
+ * 512, after confirming libnfs's unit) is TODO. */
 static long long nfs_blocksOf(const struct nfs_stat_64 *st)
 {
 	if (st->nfs_blocks != 0) {
