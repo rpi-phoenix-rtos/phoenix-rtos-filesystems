@@ -44,6 +44,11 @@ typedef struct nfs_node {
 	int idle;                  /* 1 while parked on the idle LRU, else 0 */
 	struct nfs_node *idleNext; /* idle LRU (MRU at head); valid only while idle != 0 */
 	struct nfs_node *idlePrev;
+	int pathDetached;          /* 1 once unbound from byPath by an unlink-while-open (the file was
+	                              removed but open fds keep it alive). The node stays reachable by id
+	                              for those fds, but its name is free for a fresh node so a later
+	                              create/lookup of the same path does not alias this (now orphaned)
+	                              node's cached fh. */
 } nfs_node_t;
 
 
@@ -80,6 +85,12 @@ extern nfs_node_t *nfs_node_get(nfs_nodeTree_t *t, const char *path);
  * unlinks the node from the idle LRU first; the caller is responsible for
  * nfs_close()ing n->fh (which needs the libnfs context) beforehand. */
 extern void nfs_node_remove(nfs_nodeTree_t *t, nfs_node_t *n);
+
+/* Unbind a still-open node from the byPath index (unlink-while-open). The node
+ * stays in byId (open fds keep resolving it) but a later create/lookup of the
+ * same path mints a fresh node instead of aliasing this orphaned one. Idempotent;
+ * a no-op for the root. n->path/n->fh are intentionally left intact for the fds. */
+extern void nfs_node_detachPath(nfs_nodeTree_t *t, nfs_node_t *n);
 
 /* Lazy-close idle LRU (#156), structural only (no nfs_close — see nfs_ops.c):
  * push a node to the MRU head (sets idle, bumps idleCount) and unlink it

@@ -141,9 +141,28 @@ void nfs_node_remove(nfs_nodeTree_t *t, nfs_node_t *n)
 	nfs_node_idleUnlink(t, n);
 
 	lib_rbRemove(&t->byId, &n->idLinkage);
-	lib_rbRemove(&t->byPath, &n->pathLinkage);
+	/* A node already unbound by nfs_node_detachPath() is no longer in byPath;
+	 * removing it again would corrupt the tree. */
+	if (n->pathDetached == 0) {
+		lib_rbRemove(&t->byPath, &n->pathLinkage);
+	}
 	free(n->path);
 	free(n);
+}
+
+
+void nfs_node_detachPath(nfs_nodeTree_t *t, nfs_node_t *n)
+{
+	if ((n == NULL) || (n->id == NFS_ROOTID) || (n->pathDetached != 0)) {
+		return;
+	}
+
+	/* Defensive: a still-open node shouldn't be on the idle LRU (refs > 0), but
+	 * keep the links consistent regardless. */
+	nfs_node_idleUnlink(t, n);
+
+	lib_rbRemove(&t->byPath, &n->pathLinkage);
+	n->pathDetached = 1;
 }
 
 

@@ -382,6 +382,18 @@ int nfs_ops_close(nfs_fs_t *fs, oid_t *oid)
 		n->refs--;
 	}
 
+	/* Last close of an unlinked-while-open file (detached from byPath): the node
+	 * can never be reused by name, so don't park it on the idle LRU (which never
+	 * frees nodes). Close its orphaned fh and remove it outright. */
+	if ((n->refs == 0) && (n->pathDetached != 0)) {
+		if (n->fh != NULL) {
+			nfs_close(fs->nfs, n->fh);
+			n->fh = NULL;
+		}
+		nfs_node_remove(&fs->nodes, n);
+		return 0;
+	}
+
 	/* Lazy-close (#156): on the last close, do NOT nfs_close the fh. Park the
 	 * node on the idle LRU so the next open reuses the open fh (collapsing the
 	 * loader's per-page open/close RPC pair). Only an over-cap eviction, an
@@ -880,14 +892,24 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	/* Drop any cached node for this path (find-only: don't materialize one). */
 	nfs_node_t *n = nfs_node_findPath(&fs->nodes, path);
 	free(path);
-	if ((rc == 0) && (n != NULL) && (n->refs == 0)) {
-		/* A node at refs==0 may still hold a lazily-cached fh on the idle LRU
-		 * (#156); close it before removing so the fh isn't leaked. */
-		if (n->fh != NULL) {
-			nfs_close(fs->nfs, n->fh);
-			n->fh = NULL;
+	if ((rc == 0) && (n != NULL)) {
+		if (n->refs == 0) {
+			/* A node at refs==0 may still hold a lazily-cached fh on the idle LRU
+			 * (#156); close it before removing so the fh isn't leaked. */
+			if (n->fh != NULL) {
+				nfs_close(fs->nfs, n->fh);
+				n->fh = NULL;
+			}
+			nfs_node_remove(&fs->nodes, n);
 		}
-		nfs_node_remove(&fs->nodes, n);
+		else {
+			/* Still open: the file is gone from the directory but open fds keep it
+			 * alive server-side (POSIX unlink-while-open). Don't touch n->fh (the
+			 * fds need it) — just unbind the name so a later create/lookup of the
+			 * same path mints a FRESH node instead of aliasing this node's now-
+			 * orphaned fh (which would split writes and stat across two inodes). */
+			nfs_node_detachPath(&fs->nodes, n);
+		}
 	}
 
 	return (rc != 0) ? nfs_err(rc) : 0;
