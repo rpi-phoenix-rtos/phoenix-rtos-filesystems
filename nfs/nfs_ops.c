@@ -580,6 +580,20 @@ int nfs_ops_truncate(nfs_fs_t *fs, oid_t *oid, size_t size)
 }
 
 
+/* POSIX st_blocks is the number of 512-byte units actually allocated. libnfs
+ * reports the preferred I/O block size (nfs_blksize) but not the allocated block
+ * count (the server's SPACE_USED is not mapped), leaving nfs_blocks == 0, which
+ * makes du(1)/ls -s report 0 for every file. Approximate it from the file size
+ * when unavailable (exact for non-sparse files, the common case over NFS). */
+static long long nfs_blocksOf(const struct nfs_stat_64 *st)
+{
+	if (st->nfs_blocks != 0) {
+		return (long long)st->nfs_blocks;
+	}
+	return (long long)(((unsigned long long)st->nfs_size + 511ULL) / 512ULL);
+}
+
+
 int nfs_ops_getattr(nfs_fs_t *fs, oid_t *oid, int type, long long *attr)
 {
 	nfs_node_t *n = nfs_node_find(&fs->nodes, oid->id);
@@ -607,7 +621,7 @@ int nfs_ops_getattr(nfs_fs_t *fs, oid_t *oid, int type, long long *attr)
 			*attr = (long long)st.nfs_size;
 			break;
 		case atBlocks:
-			*attr = (long long)st.nfs_blocks;
+			*attr = nfs_blocksOf(&st);
 			break;
 		case atIOBlock:
 			*attr = (long long)st.nfs_blksize;
@@ -661,7 +675,7 @@ int nfs_ops_getattrAll(nfs_fs_t *fs, oid_t *oid, struct _attrAll *attrs)
 	attrs->gid.err = EOK;
 	attrs->size.val = (long long)st.nfs_size;
 	attrs->size.err = EOK;
-	attrs->blocks.val = (long long)st.nfs_blocks;
+	attrs->blocks.val = nfs_blocksOf(&st);
 	attrs->blocks.err = EOK;
 	attrs->ioblock.val = (long long)st.nfs_blksize;
 	attrs->ioblock.err = EOK;
