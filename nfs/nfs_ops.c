@@ -17,6 +17,7 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>   /* PATH_MAX (symlink readlink staging buffer) */
 #include <poll.h>
 #include <unistd.h>   /* usleep (transient-error retry backoff) */
 #include <sys/stat.h>
@@ -432,12 +433,35 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 	}
 
 	if (n->type == otSymlink) {
-		/* No mtReadlink op: a read of an otSymlink object returns the target. */
-		int rc = nfs_readlink(fs->nfs, n->path, buf, len);
+		/* No mtReadlink op: a read of an otSymlink object returns the target.
+		 *
+		 * libnfs 6.0.2 readlink_cb has a bug: when the target is longer than the
+		 * caller's buffer it records -ENAMETOOLONG but cb_data_is_finished()
+		 * immediately overwrites status with the RPC success code, so nfs_readlink
+		 * returns phantom success with the buffer left UNMODIFIED. Reading straight
+		 * into the (possibly small) client buffer would then return strnlen() over
+		 * stale bytes -> a bogus target -> realpath/readlink of any over-long-target
+		 * symlink resolves wrong (observed: ENOENT instead of a truncated result).
+		 *
+		 * Stage into a full PATH_MAX buffer so libnfs never takes that branch (a
+		 * valid symlink target is <= PATH_MAX), then apply POSIX readlink truncation
+		 * ourselves: copy min(target_len, len) and return that count. A caller whose
+		 * buffer is too small thus gets a returned count == its buffer size, which is
+		 * the truncation signal POSIX (and libphoenix realpath) expects. */
+		char *tmp = malloc(PATH_MAX + 1);
+		if (tmp == NULL) {
+			return -ENOMEM;
+		}
+		int rc = nfs_readlink(fs->nfs, n->path, tmp, PATH_MAX + 1);
 		if (rc != 0) {
+			free(tmp);
 			return nfs_err(rc);
 		}
-		return (int)strnlen(buf, len);
+		size_t tlen = strnlen(tmp, PATH_MAX + 1);
+		size_t cpy = (tlen < len) ? tlen : len;
+		memcpy(buf, tmp, cpy);
+		free(tmp);
+		return (int)cpy;
 	}
 
 	if (n->type == otDir) {
