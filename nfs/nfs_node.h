@@ -31,6 +31,9 @@ typedef struct nfs_node {
 	char *path;           /* canonical export-relative absolute path ("/" = root) */
 	struct nfsfh *fh;     /* non-NULL while open; else NULL */
 	int type;             /* otDir/otFile/otSymlink/otDev (from nfs_lstat64, don't-follow) */
+	unsigned mode;        /* only for a spliced special file (mnt set, type otDev): the mode
+	                         mkfifo()/mknod() asked for. Such a node has NO file on the export,
+	                         so a stat has to be answered from here or not at all. */
 	unsigned refs;        /* mtOpen refcount */
 	oid_t mnt;            /* mounted-child oid spliced here via mtSetAttr(atDev); mnt.port==0
 	                         means "no mount" (so lookup returns this node itself). Mirrors the

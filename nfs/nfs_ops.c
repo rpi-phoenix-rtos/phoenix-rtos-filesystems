@@ -74,6 +74,19 @@ static int nfs_transient(int rc)
 static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 {
 	int rc = -EIO;
+
+	/* A special file spliced in from another server (see the otDev case in
+	 * nfs_ops_create) exists only in this table, so stat'ing the export would
+	 * answer ENOENT for a name that callers can open perfectly well. Synthesise
+	 * it from what mkfifo()/mknod() asked for. */
+	if ((n->mnt.port != 0) && (n->type == otDev)) {
+		memset(st, 0, sizeof(*st));
+		st->nfs_mode = n->mode;
+		st->nfs_nlink = 1;
+		st->nfs_ino = (uint64_t)n->id;
+		return 0;
+	}
+
 	for (int tries = 0; tries < 25; tries++) {
 		rc = nfs_lstat64(fs->nfs, n->path, st);
 		if ((rc == 0) || !nfs_transient(rc)) {
@@ -236,6 +249,35 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		char *child = nfs_node_joinPath(cur, nm);
 		if (child == NULL) {
 			return -ENOMEM;
+		}
+
+		/* A component may be a locally-spliced foreign object -- a mounted child
+		 * fs, or a FIFO/device node whose owner is another server (see the
+		 * otDev case in nfs_ops_create). Those have NO file on the export, so
+		 * the stat below would correctly answer ENOENT. Resolve them from the
+		 * local table first and hand back the owner's oid; the kernel then
+		 * re-resolves any remainder against that server. */
+		{
+			nfs_node_t *ln = nfs_node_findPath(&fs->nodes, child);
+
+			if ((ln != NULL) && (ln->mnt.port != 0)) {
+				free(child);
+				if (ln->type == otDev) {
+					/* Special file: the NODE is ours (stat must reach us), only
+					 * opens go to the owner. Same split dummyfs uses -- handing
+					 * back the foreign oid for both made stat() return EINVAL,
+					 * because posixsrv was being asked to describe a file. */
+					res->port = fs->port;
+					res->id = ln->id;
+					*dev = ln->mnt;
+				}
+				else {
+					/* Mountpoint: the child fs owns everything below here. */
+					*res = ln->mnt;
+					*dev = ln->mnt;
+				}
+				return len + comp;
+			}
 		}
 
 		struct nfs_stat_64 st;
@@ -798,7 +840,6 @@ int nfs_ops_setattr(nfs_fs_t *fs, oid_t *oid, int type, long long val, const voi
 
 int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsigned mode, int type, oid_t *dev)
 {
-	(void)dev; /* device oid only meaningful for block/char nodes, which we mknod with dev=0 */
 	nfs_node_t *d = nfs_node_find(&fs->nodes, dir->id);
 	if (d == NULL) {
 		return -ENOENT;
@@ -838,7 +879,22 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 		}
 
 		case otDev:
-			rc = nfs_mknod(fs->nfs, path, (int)mode, 0);
+			/* A device or FIFO node. `dev` is the oid of the server that owns
+			 * the object, and that binding is the entire point: opens of this
+			 * name must reach THAT server. nfs_mknod() cannot express it, and
+			 * over NFSv4 it fails outright -- which is how every mkfifo() on an
+			 * NFS root came back EIO (posix_mkfifo creates the pipe in posixsrv
+			 * and then asks the owning filesystem for an otDev node carrying its
+			 * oid; libc/stdio's wrong_stream_type_fifo has been failing on
+			 * exactly this). So do not touch the server: record the name locally
+			 * and splice the foreign oid in below, the same way lookup already
+			 * resolves a mounted child (node->mnt).
+			 *
+			 * Consequence to know about: the name lives in this mount only, so a
+			 * readdir on the export does not list it and it does not survive a
+			 * remount. That matches what the object is -- a pipe in another
+			 * process, which could not be reconstructed from the server anyway. */
+			rc = 0;
 			break;
 
 		default:
@@ -857,6 +913,10 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 		return -ENOMEM;
 	}
 	n->type = (type == otDir) ? otDir : ((type == otSymlink) ? otSymlink : ((type == otDev) ? otDev : otFile));
+	if ((type == otDev) && (dev != NULL)) {
+		n->mnt = *dev;   /* opens of this name go to the owning server */
+		n->mode = mode;  /* ... but WE answer stat: there is no file to stat */
+	}
 
 	res->port = fs->port;
 	res->id = n->id;
@@ -896,6 +956,19 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	char *path = nfs_node_joinPath(d->path, name);
 	if (path == NULL) {
 		return -ENOMEM;
+	}
+
+	/* A locally-spliced foreign object (FIFO/device from another server) has no
+	 * file on the export: drop the local binding and stop, or the stat below
+	 * would report ENOENT for a name that does exist as far as callers see. */
+	{
+		nfs_node_t *ln = nfs_node_findPath(&fs->nodes, path);
+
+		if ((ln != NULL) && (ln->mnt.port != 0)) {
+			free(path);
+			nfs_node_remove(&fs->nodes, ln);
+			return 0;
+		}
 	}
 
 	/* don't-follow stat: a symlink-to-a-dir is otSymlink -> nfs_unlink. */
@@ -943,14 +1016,18 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid)
 {
 	nfs_node_t *d = nfs_node_find(&fs->nodes, dir->id);
-	nfs_node_t *target = nfs_node_find(&fs->nodes, oid->id);
-	if ((d == NULL) || (target == NULL)) {
+	if (d == NULL) {
 		return -ENOENT;
 	}
 
 	char *path = nfs_node_joinPath(d->path, name);
 	if (path == NULL) {
 		return -ENOMEM;
+	}
+
+	nfs_node_t *target = nfs_node_find(&fs->nodes, oid->id);
+	if (target == NULL) {
+		return -ENOENT;
 	}
 
 	int rc = nfs_link(fs->nfs, target->path, path);
