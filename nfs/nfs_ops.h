@@ -42,6 +42,10 @@ typedef struct {
 	const char *server;
 	const char *export;
 	int version;
+	/* The one node currently holding an open directory snapshot (see dirCache in
+	 * nfs_node.h), or NULL. Keeping it to one bounds how much listing memory a
+	 * scan can pin, and a scan reads one directory at a time. */
+	nfs_node_t *scanNode;
 } nfs_fs_t;
 
 

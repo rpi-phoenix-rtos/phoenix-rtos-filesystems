@@ -59,6 +59,18 @@ typedef struct nfs_node {
 	 * mtOpen deliberately bypasses it (see nfs_ops.c). */
 	struct nfs_stat_64 attr;
 	uint64_t attrValid;        /* CLOCK_MONOTONIC deadline in us; 0 = nothing cached */
+	/* Sequential-scan directory snapshot. POSIX readdir hands back ONE entry per
+	 * call, and libnfs's nfs_opendir snapshots the whole directory (a READDIR round
+	 * trip, or several for a big one). Re-opening per call therefore cost a full
+	 * listing PER ENTRY: ~38 ms per readdir() on a 649-entry export directory, so
+	 * walking one such directory took ~25 s and the cost grew with its size. Hold
+	 * the snapshot open across the scan and step through it locally instead: one
+	 * listing per scan. dirOffs is the cookie the snapshot is positioned at; a
+	 * caller that seeks anywhere else (a rewind to 0 included) re-snapshots, which
+	 * is also what keeps a re-scan from seeing a stale listing. At most one node
+	 * holds a snapshot at a time (nfs_fs_t.scanNode). */
+	struct nfsdir *dirCache;
+	off_t dirOffs;
 	int pathDetached;          /* 1 once unbound from byPath by an unlink-while-open (the file was
 	                              removed but open fds keep it alive). The node stays reachable by id
 	                              for those fds, but its name is free for a fresh node so a later

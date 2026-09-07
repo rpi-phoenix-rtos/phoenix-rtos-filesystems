@@ -126,6 +126,23 @@ static void nfs_attrDrop(nfs_node_t *n)
 }
 
 
+/* Close a node's cached directory snapshot, if it holds one. Safe to call on a
+ * node that never had one, and on the node currently registered as fs->scanNode. */
+static void nfs_dirDrop(nfs_fs_t *fs, nfs_node_t *n)
+{
+	if ((n == NULL) || (n->dirCache == NULL)) {
+		return;
+	}
+
+	nfs_closedir(fs->nfs, n->dirCache);
+	n->dirCache = NULL;
+	n->dirOffs = 0;
+	if (fs->scanNode == n) {
+		fs->scanNode = NULL;
+	}
+}
+
+
 /* Refresh a node's cached type via a don't-follow stat. Returns 0 or -errno. Bounded retry on
  * transient RPC errors (contributes to the intermittent exec -5: the mtOpen path stats first).
  *
@@ -230,7 +247,11 @@ static int nfs_reclaim(nfs_fs_t *fs)
 
 	struct nfs_context *old = fs->nfs;
 	fs->nfs = fresh;
+	/* invalidateHandles forgets the cached fhs AND directory snapshots
+	 * structurally — they belong to the context about to be destroyed, so they
+	 * must not be closed through it. */
 	nfs_node_invalidateHandles(&fs->nodes);
+	fs->scanNode = NULL;
 	nfs_destroy_context(old);
 
 	printf("nfs-fs: reclaimed NFSv4 client state (re-mounted %s:%s)\n", fs->server, fs->export);
@@ -1008,6 +1029,7 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 	}
 	nfs_attrDrop(d); /* directory mtime/nlink moved */
 	nfs_attrDrop(n); /* a name reused after an unlink must not inherit the old stat */
+	nfs_dirDrop(fs, d); /* ... and its listing no longer has every name in it */
 	n->type = (type == otDir) ? otDir : ((type == otSymlink) ? otSymlink : ((type == otDev) ? otDev : otFile));
 	if ((type == otDev) && (dev != NULL)) {
 		n->mnt = *dev;   /* opens of this name go to the owning server */
@@ -1032,6 +1054,7 @@ int nfs_ops_destroy(nfs_fs_t *fs, oid_t *oid)
 		nfs_close(fs->nfs, n->fh);
 		n->fh = NULL;
 	}
+	nfs_dirDrop(fs, n);
 	nfs_node_remove(&fs->nodes, n);
 
 	return 0;
@@ -1062,6 +1085,7 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 
 		if ((ln != NULL) && (ln->mnt.port != 0)) {
 			free(path);
+			nfs_dirDrop(fs, ln);
 			nfs_node_remove(&fs->nodes, ln);
 			return 0;
 		}
@@ -1083,6 +1107,7 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	}
 
 	nfs_attrDrop(d); /* directory mtime/nlink moved */
+	nfs_dirDrop(fs, d); /* ... and its listing still has the removed name in it */
 
 	/* Drop any cached node for this path (find-only: don't materialize one). */
 	nfs_node_t *n = nfs_node_findPath(&fs->nodes, path);
@@ -1095,6 +1120,7 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 				nfs_close(fs->nfs, n->fh);
 				n->fh = NULL;
 			}
+			nfs_dirDrop(fs, n);
 			nfs_node_remove(&fs->nodes, n);
 		}
 		else {
@@ -1147,15 +1173,11 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		return -EINVAL;
 	}
 
-	/* Snapshot strategy: open the dir, walk to the cumulative-name-length
-	 * cookie (matching dummyfs semantics where the cookie is sum of name
-	 * lengths, d_reclen == name length), emit that one entry, close. */
-	struct nfsdir *nfsdir = NULL;
-	int rc = nfs_opendir(fs->nfs, d->path, &nfsdir);
-	if (rc != 0) {
-		return nfs_err(rc);
-	}
-
+	/* Snapshot strategy: walk to the cumulative-name-length cookie (matching
+	 * dummyfs semantics where the cookie is the sum of name lengths and
+	 * d_reclen == name length) and emit that one entry. The snapshot is kept
+	 * open between calls (see dirCache in nfs_node.h) so a sequential scan pays
+	 * for ONE listing rather than one per entry. */
 	struct nfsdirent *ent;
 	int emitted = -ENOENT;
 
@@ -1183,11 +1205,38 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		dent->d_type = otDir;
 		memcpy(dent->d_name, dot, namelen);
 		dent->d_name[namelen] = '\0';
-		nfs_closedir(fs->nfs, nfsdir);
+		/* offs 0 is a fresh scan (or a rewind): forget any snapshot so the entries
+		 * this scan goes on to read are listed now, not inherited from last time. */
+		if (offs == 0) {
+			nfs_dirDrop(fs, d);
+		}
 		return 0;
 	}
 
-	off_t diroffs = 3;
+	/* Reuse the snapshot only if it is positioned exactly at the requested cookie;
+	 * anything else (a seek, a second interleaved scan) re-lists. */
+	struct nfsdir *nfsdir;
+	off_t diroffs;
+
+	if ((d->dirCache != NULL) && (d->dirOffs == offs)) {
+		nfsdir = d->dirCache;
+		diroffs = offs;
+	}
+	else {
+		nfs_dirDrop(fs, d);
+		/* One snapshot at a time across the whole fs, so a scan cannot pin an
+		 * unbounded amount of listing memory. */
+		nfs_dirDrop(fs, fs->scanNode);
+
+		int rc = nfs_opendir(fs->nfs, d->path, &nfsdir);
+		if (rc != 0) {
+			return nfs_err(rc);
+		}
+		d->dirCache = nfsdir;
+		fs->scanNode = d;
+		diroffs = 3;
+	}
+
 	while ((ent = nfs_readdir(fs->nfs, nfsdir)) != NULL) {
 		size_t namelen = strlen(ent->name);
 
@@ -1226,13 +1275,20 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 			memcpy(dent->d_name, ent->name, namelen);
 			dent->d_name[namelen] = '\0';
 			emitted = 0;
+			/* Leave the snapshot open, positioned at the next entry, so the next
+			 * call is a local step instead of another listing. */
+			d->dirOffs = offs + (off_t)namelen;
 			break;
 		}
 
 		diroffs += (off_t)namelen;
 	}
 
-	nfs_closedir(fs->nfs, nfsdir);
+	if (emitted != 0) {
+		/* End of directory, or the caller's buffer was too small: either way the
+		 * snapshot is no longer positioned anywhere useful. */
+		nfs_dirDrop(fs, d);
+	}
 
 	return emitted;
 }

@@ -241,6 +241,11 @@ void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
 		/* The reclaim means the server's state moved on without us; a cached
 		 * attribute from before it is not something we can vouch for. */
 		n->attrValid = 0;
+		/* Same for a directory snapshot: it belongs to the destroyed context, so
+		 * forget the pointer WITHOUT closing it (there is nothing to close it
+		 * through any more). The caller clears nfs_fs_t.scanNode. */
+		n->dirCache = NULL;
+		n->dirOffs = 0;
 	}
 
 	/* The idle LRU referenced the now-invalidated fhs; reset it wholesale. */
