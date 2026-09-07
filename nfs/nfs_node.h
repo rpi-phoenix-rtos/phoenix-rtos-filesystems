@@ -19,6 +19,8 @@
 #include <sys/rb.h>
 #include <sys/file.h> /* otDir/otFile/otSymlink/otDev/otUnknown + atX attr enums */
 
+#include <nfsc/libnfs.h> /* struct nfs_stat_64 (cached attributes, see below) */
+
 struct nfsfh;
 
 #define NFS_ROOTID 0
@@ -47,6 +49,16 @@ typedef struct nfs_node {
 	int idle;                  /* 1 while parked on the idle LRU, else 0 */
 	struct nfs_node *idleNext; /* idle LRU (MRU at head); valid only while idle != 0 */
 	struct nfs_node *idlePrev;
+	/* Positive attribute cache. Path resolution is quadratic without it: resolving a
+	 * depth-d absolute path makes libphoenix issue one lookup per prefix, and each
+	 * lookup lstats EVERY component of its prefix -- d(d+1)/2 round trips to describe
+	 * d distinct paths (measured: 26 round trips at d=5, ~1.37 ms each). Remembering a
+	 * component's don't-follow stat for a few milliseconds collapses that to one lstat
+	 * per distinct path. Valid while attrValid != 0 and CLOCK_MONOTONIC has not passed
+	 * it; every op that mutates the object -- or frees its name -- clears it, and
+	 * mtOpen deliberately bypasses it (see nfs_ops.c). */
+	struct nfs_stat_64 attr;
+	uint64_t attrValid;        /* CLOCK_MONOTONIC deadline in us; 0 = nothing cached */
 	int pathDetached;          /* 1 once unbound from byPath by an unlink-while-open (the file was
 	                              removed but open fds keep it alive). The node stays reachable by id
 	                              for those fds, but its name is free for a fresh node so a later
@@ -109,7 +121,8 @@ extern nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t);
  * nfs_close). Used by the NFSv4 state-expiry reclaim (nfs_ops.c): after the
  * libnfs context is rebuilt, all previously cached fhs belong to the destroyed
  * context and their open stateids are dead, so they must be forgotten. The
- * id<->path table is preserved (paths are stable). */
+ * id<->path table is preserved (paths are stable). Also drops every cached
+ * attribute: the reclaim implies we lost track of what the server did meanwhile. */
 extern void nfs_node_invalidateHandles(nfs_nodeTree_t *t);
 
 /* Join a parent directory path and a single name component into a freshly

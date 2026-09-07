@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <limits.h>   /* PATH_MAX (symlink readlink staging buffer) */
 #include <poll.h>
+#include <time.h>     /* clock_gettime (attribute-cache deadlines) */
 #include <unistd.h>   /* usleep (transient-error retry backoff) */
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -69,9 +70,69 @@ static int nfs_transient(int rc)
 }
 
 
+/* How long a node's don't-follow stat may be reused. Path resolution issues a
+ * burst of lookups for the SAME prefixes within a few milliseconds (see the
+ * attribute-cache comment in nfs_node.h), so a very short window already removes
+ * the quadratic term. Keep it short: it is the only interval in which a change
+ * made directly on the server can be invisible here. For reference, a Linux NFS
+ * client caches regular-file attributes for 3-60 s (acregmin/acregmax). */
+#define NFS_ATTR_TTL_US 100000u
+
+
+/* CLOCK_MONOTONIC in microseconds, or 0 if unavailable (treated as "no cache"). */
+static uint64_t nfs_nowUs(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+		return 0;
+	}
+	return ((uint64_t)ts.tv_sec * 1000000ULL) + ((uint64_t)ts.tv_nsec / 1000ULL);
+}
+
+
+static int nfs_attrFresh(const nfs_node_t *n)
+{
+	if (n->attrValid == 0) {
+		return 0;
+	}
+
+	uint64_t now = nfs_nowUs();
+
+	return ((now != 0) && (now < n->attrValid)) ? 1 : 0;
+}
+
+
+static void nfs_attrStore(nfs_node_t *n, const struct nfs_stat_64 *st)
+{
+	uint64_t now = nfs_nowUs();
+
+	if (now == 0) {
+		n->attrValid = 0;
+		return;
+	}
+	n->attr = *st;
+	n->attrValid = now + NFS_ATTR_TTL_US;
+}
+
+
+/* Forget what we cached about a node — call from every op that changes the
+ * object (or its name) so the next stat goes back to the server. */
+static void nfs_attrDrop(nfs_node_t *n)
+{
+	if (n != NULL) {
+		n->attrValid = 0;
+	}
+}
+
+
 /* Refresh a node's cached type via a don't-follow stat. Returns 0 or -errno. Bounded retry on
- * transient RPC errors (contributes to the intermittent exec -5: the mtOpen path stats first). */
-static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
+ * transient RPC errors (contributes to the intermittent exec -5: the mtOpen path stats first).
+ *
+ * Answered from the node's attribute cache unless `force` is set; a fresh stat
+ * repopulates it. Pass force != 0 where the point of the call IS to observe the
+ * server (mtOpen's redeploy check). */
+static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st, int force)
 {
 	int rc = -EIO;
 
@@ -87,6 +148,14 @@ static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 		return 0;
 	}
 
+	/* NOTE: below the spliced-special-file branch on purpose — that node has no
+	 * file on the export, so it must always be answered by synthesis. */
+	if ((force == 0) && (nfs_attrFresh(n) != 0)) {
+		*st = n->attr;
+		n->type = nfs_typeFromMode(st->nfs_mode);
+		return 0;
+	}
+
 	for (int tries = 0; tries < 25; tries++) {
 		rc = nfs_lstat64(fs->nfs, n->path, st);
 		if ((rc == 0) || !nfs_transient(rc)) {
@@ -95,9 +164,11 @@ static int nfs_refreshStat(nfs_fs_t *fs, nfs_node_t *n, struct nfs_stat_64 *st)
 		usleep(tries < 6 ? (10000u << tries) : 640000u);
 	}
 	if (rc != 0) {
+		nfs_attrDrop(n);
 		return nfs_err(rc);
 	}
 	n->type = nfs_typeFromMode(st->nfs_mode);
+	nfs_attrStore(n, st);
 	return 0;
 }
 
@@ -257,46 +328,55 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 		 * the stat below would correctly answer ENOENT. Resolve them from the
 		 * local table first and hand back the owner's oid; the kernel then
 		 * re-resolves any remainder against that server. */
-		{
-			nfs_node_t *ln = nfs_node_findPath(&fs->nodes, child);
-
-			if ((ln != NULL) && (ln->mnt.port != 0)) {
-				free(child);
-				if (ln->type == otDev) {
-					/* Special file: the NODE is ours (stat must reach us), only
-					 * opens go to the owner. Same split dummyfs uses -- handing
-					 * back the foreign oid for both made stat() return EINVAL,
-					 * because posixsrv was being asked to describe a file. */
-					res->port = fs->port;
-					res->id = ln->id;
-					*dev = ln->mnt;
-				}
-				else {
-					/* Mountpoint: the child fs owns everything below here. */
-					*res = ln->mnt;
-					*dev = ln->mnt;
-				}
-				return len + comp;
+		nfs_node_t *ln = nfs_node_findPath(&fs->nodes, child);
+		if ((ln != NULL) && (ln->mnt.port != 0)) {
+			free(child);
+			if (ln->type == otDev) {
+				/* Special file: the NODE is ours (stat must reach us), only
+				 * opens go to the owner. Same split dummyfs uses -- handing
+				 * back the foreign oid for both made stat() return EINVAL,
+				 * because posixsrv was being asked to describe a file. */
+				res->port = fs->port;
+				res->id = ln->id;
+				*dev = ln->mnt;
 			}
+			else {
+				/* Mountpoint: the child fs owns everything below here. */
+				*res = ln->mnt;
+				*dev = ln->mnt;
+			}
+			return len + comp;
 		}
 
 		struct nfs_stat_64 st;
-		/* Bounded retry on transient RPC errors (connection reset/timeout); a genuine missing
-		 * entry (ENOENT) breaks immediately. Otherwise a transient stat failure during path
-		 * resolution fails the whole open/exec (contributes to the intermittent exec -5). */
-		int rc = -EIO;
-		for (int tries = 0; tries < 25; tries++) {
-			rc = nfs_lstat64(fs->nfs, child, &st);
-			if (rc == 0) {
-				break;
+		int rc = 0;
+		int cached = 0;
+		/* Already described this component recently? Resolving one absolute path
+		 * walks its prefixes repeatedly (see nfs_node.h), so nearly every
+		 * component below the leaf is answered from here rather than the wire. */
+		if ((ln != NULL) && (nfs_attrFresh(ln) != 0)) {
+			st = ln->attr;
+			cached = 1;
+		}
+		else {
+			/* Bounded retry on transient RPC errors (connection reset/timeout); a genuine missing
+			 * entry (ENOENT) breaks immediately. Otherwise a transient stat failure during path
+			 * resolution fails the whole open/exec (contributes to the intermittent exec -5). */
+			rc = -EIO;
+			for (int tries = 0; tries < 25; tries++) {
+				rc = nfs_lstat64(fs->nfs, child, &st);
+				if (rc == 0) {
+					break;
+				}
+				int e = nfs_err(rc);
+				if (e != -EIO && e != -ETIMEDOUT) {
+					break;
+				}
+				usleep(tries < 6 ? (10000u << tries) : 640000u);
 			}
-			int e = nfs_err(rc);
-			if (e != -EIO && e != -ETIMEDOUT) {
-				break;
-			}
-			usleep(tries < 6 ? (10000u << tries) : 640000u);
 		}
 		if (rc != 0) {
+			nfs_attrDrop(ln);
 			free(child);
 			/* Route through nfs_err so a transient RPC error (EIO/ESTALE/
 			 * ETIMEDOUT) is reported as itself rather than masked as "no such
@@ -311,6 +391,11 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 			return -ENOMEM;
 		}
 		cn->type = nfs_typeFromMode(st.nfs_mode);
+		/* Only a stat we just took extends the window — re-stamping a cache hit
+		 * would keep one entry alive indefinitely under a repeated lookup. */
+		if (cached == 0) {
+			nfs_attrStore(cn, &st);
+		}
 
 		len += comp;
 		node = cn;
@@ -371,9 +456,10 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 		return 0;
 	}
 
-	/* Re-stat on open so a redeployed file isn't shadowed (OQ-B). */
+	/* Re-stat on open so a redeployed file isn't shadowed (OQ-B) — force, since
+	 * answering this from the attribute cache would defeat its whole purpose. */
 	struct nfs_stat_64 st;
-	int rc = nfs_refreshStat(fs, n, &st);
+	int rc = nfs_refreshStat(fs, n, &st, 1);
 	if (rc != 0) {
 		return rc;
 	}
@@ -620,6 +706,7 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 		int rc = nfs_pwrite(fs->nfs, fh, (void *)buf, len, offs);
 
 		if (rc >= 0) {
+			nfs_attrDrop(n); /* size/mtime moved */
 			if (owned != 0) {
 				nfs_close(fs->nfs, fh);
 			}
@@ -653,6 +740,7 @@ int nfs_ops_truncate(nfs_fs_t *fs, oid_t *oid, size_t size)
 	else {
 		rc = nfs_truncate(fs->nfs, n->path, size);
 	}
+	nfs_attrDrop(n); /* size/mtime moved */
 
 	return (rc != 0) ? nfs_err(rc) : 0;
 }
@@ -682,7 +770,7 @@ int nfs_ops_getattr(nfs_fs_t *fs, oid_t *oid, int type, long long *attr)
 	}
 
 	struct nfs_stat_64 st;
-	int rc = nfs_refreshStat(fs, n, &st);
+	int rc = nfs_refreshStat(fs, n, &st, 0);
 	if (rc != 0) {
 		return rc;
 	}
@@ -740,7 +828,7 @@ int nfs_ops_getattrAll(nfs_fs_t *fs, oid_t *oid, struct _attrAll *attrs)
 	}
 
 	struct nfs_stat_64 st;
-	int rc = nfs_refreshStat(fs, n, &st);
+	int rc = nfs_refreshStat(fs, n, &st, 0);
 	if (rc != 0) {
 		return rc;
 	}
@@ -784,6 +872,10 @@ int nfs_ops_setattr(nfs_fs_t *fs, oid_t *oid, int type, long long val, const voi
 	}
 
 	int rc = 0;
+	/* Every branch below changes something a stat reports (mode, size, times) or
+	 * what the node even is (atDev), so nothing cached about it survives. */
+	nfs_attrDrop(n);
+
 	switch (type) {
 		case atMode:
 			rc = nfs_chmod(fs->nfs, n->path, (int)(val & ALLPERMS));
@@ -804,6 +896,8 @@ int nfs_ops_setattr(nfs_fs_t *fs, oid_t *oid, int type, long long val, const voi
 			 * stat the other and write both back. */
 			{
 				struct nfs_stat_64 st;
+				/* Direct lstat, not nfs_refreshStat: we are about to write these
+				 * timestamps back, so they must be the server's current ones. */
 				if (nfs_lstat64(fs->nfs, n->path, &st) != 0) {
 					return -EIO;
 				}
@@ -912,6 +1006,8 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 	if (n == NULL) {
 		return -ENOMEM;
 	}
+	nfs_attrDrop(d); /* directory mtime/nlink moved */
+	nfs_attrDrop(n); /* a name reused after an unlink must not inherit the old stat */
 	n->type = (type == otDir) ? otDir : ((type == otSymlink) ? otSymlink : ((type == otDev) ? otDev : otFile));
 	if ((type == otDev) && (dev != NULL)) {
 		n->mnt = *dev;   /* opens of this name go to the owning server */
@@ -986,6 +1082,8 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 		rc = nfs_unlink(fs->nfs, path);
 	}
 
+	nfs_attrDrop(d); /* directory mtime/nlink moved */
+
 	/* Drop any cached node for this path (find-only: don't materialize one). */
 	nfs_node_t *n = nfs_node_findPath(&fs->nodes, path);
 	free(path);
@@ -1032,6 +1130,8 @@ int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid)
 
 	int rc = nfs_link(fs->nfs, target->path, path);
 	free(path);
+	nfs_attrDrop(d);      /* directory mtime moved */
+	nfs_attrDrop(target); /* st_nlink moved */
 
 	return (rc != 0) ? nfs_err(rc) : 0;
 }

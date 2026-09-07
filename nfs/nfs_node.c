@@ -163,6 +163,9 @@ void nfs_node_detachPath(nfs_nodeTree_t *t, nfs_node_t *n)
 
 	lib_rbRemove(&t->byPath, &n->pathLinkage);
 	n->pathDetached = 1;
+	/* The name is now free for a fresh node; anything cached about it described
+	 * the entry that just went away (unlink-while-open). */
+	n->attrValid = 0;
 }
 
 
@@ -235,6 +238,9 @@ void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
 		n->idle = 0;
 		n->idleNext = NULL;
 		n->idlePrev = NULL;
+		/* The reclaim means the server's state moved on without us; a cached
+		 * attribute from before it is not something we can vouch for. */
+		n->attrValid = 0;
 	}
 
 	/* The idle LRU referenced the now-invalidated fhs; reset it wholesale. */
