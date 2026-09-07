@@ -540,6 +540,9 @@ int nfs_ops_close(nfs_fs_t *fs, oid_t *oid)
 			nfs_close(fs->nfs, n->fh);
 			n->fh = NULL;
 		}
+		/* A directory removed while a scan held it open reaches here too, and the
+		 * node is about to be freed — the snapshot must not outlive it. */
+		nfs_dirDrop(fs, n);
 		nfs_node_remove(&fs->nodes, n);
 		return 0;
 	}
