@@ -241,9 +241,9 @@ void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
 		/* The reclaim means the server's state moved on without us; a cached
 		 * attribute from before it is not something we can vouch for. */
 		n->attrValid = 0;
-		/* Same for a directory snapshot: it belongs to the destroyed context, so
-		 * forget the pointer WITHOUT closing it (there is nothing to close it
-		 * through any more). The caller clears nfs_fs_t.scanNode. */
+		/* Directory snapshots are closed by the caller BEFORE the context swap
+		 * (nfs_reclaim), so there should be none left here; null them anyway so
+		 * no stale pointer can survive a reclaim by any route. */
 		n->dirCache = NULL;
 		n->dirOffs = 0;
 	}

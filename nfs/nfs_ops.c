@@ -127,19 +127,28 @@ static void nfs_attrDrop(nfs_node_t *n)
 
 
 /* Close a node's cached directory snapshot, if it holds one. Safe to call on a
- * node that never had one, and on the node currently registered as fs->scanNode. */
+ * node that never had one, and on the node currently registered as fs->scanNode.
+ *
+ * Clears scanNode BEFORE the "nothing cached" early return, so this is the one
+ * authority on the pairing rather than relying on every caller to have kept
+ * scanNode and dirCache consistent. */
 static void nfs_dirDrop(nfs_fs_t *fs, nfs_node_t *n)
 {
-	if ((n == NULL) || (n->dirCache == NULL)) {
+	if (n == NULL) {
+		return;
+	}
+
+	if (fs->scanNode == n) {
+		fs->scanNode = NULL;
+	}
+
+	if (n->dirCache == NULL) {
 		return;
 	}
 
 	nfs_closedir(fs->nfs, n->dirCache);
 	n->dirCache = NULL;
 	n->dirOffs = 0;
-	if (fs->scanNode == n) {
-		fs->scanNode = NULL;
-	}
 }
 
 
@@ -245,13 +254,21 @@ static int nfs_reclaim(nfs_fs_t *fs)
 		return -EIO;
 	}
 
+	/* Close any open directory snapshot through the context that owns it, while
+	 * we still have that context. nfs_closedir with the dircache disabled (see
+	 * srv.c) lands in nfs_free_nfsdir, which ignores its nfs argument entirely,
+	 * so this is safe here — and it is the only thing that frees the listing:
+	 * nfs_destroy_context only walks the dircache list, which we keep empty, so
+	 * dropping the pointer instead would strand the snapshot and every strdup'd
+	 * name in it (tens of KB for a large directory) on every reclaim. */
+	nfs_dirDrop(fs, fs->scanNode);
+
 	struct nfs_context *old = fs->nfs;
 	fs->nfs = fresh;
-	/* invalidateHandles forgets the cached fhs AND directory snapshots
-	 * structurally — they belong to the context about to be destroyed, so they
-	 * must not be closed through it. */
+	/* The cached filehandles belong to the context about to be destroyed and
+	 * their open stateids are dead, so they are forgotten structurally rather
+	 * than closed. */
 	nfs_node_invalidateHandles(&fs->nodes);
-	fs->scanNode = NULL;
 	nfs_destroy_context(old);
 
 	printf("nfs-fs: reclaimed NFSv4 client state (re-mounted %s:%s)\n", fs->server, fs->export);
@@ -545,6 +562,14 @@ int nfs_ops_close(nfs_fs_t *fs, oid_t *oid)
 		nfs_dirDrop(fs, n);
 		nfs_node_remove(&fs->nodes, n);
 		return 0;
+	}
+
+	/* A directory never gets an fh (nfs_ops_open opens one only for otFile), so
+	 * neither branch below covers it: an abandoned or partial scan would pin its
+	 * whole listing until some other readdir happened to evict it. Release it
+	 * here, where the owner actually says it is done. */
+	if ((n->refs == 0) && (n->type == otDir)) {
+		nfs_dirDrop(fs, n);
 	}
 
 	/* Lazy-close (#156): on the last close, do NOT nfs_close the fh. Park the
@@ -1191,6 +1216,15 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 	if ((offs == 0) || (offs == 1)) {
 		const char *dot = (offs == 0) ? "." : "..";
 		size_t namelen = (offs == 0) ? 1 : 2;
+
+		/* Bound this write like the main path below. The real client always
+		 * passes sizeof(struct dirent) + NAME_MAX + 1, but dent/size come
+		 * straight off the message, so a malformed mtReaddir must not get a
+		 * write into a buffer we never measured. */
+		if ((dent == NULL) || ((sizeof(struct dirent) + namelen + 1) > size)) {
+			return -EINVAL;
+		}
+
 		/* Resolve the real NFS inode so "." (this dir) and ".." (its parent) carry
 		 * correct, mutually-distinct inode numbers (the server resolves the trailing
 		 * ".." for us) rather than both reusing d->id. Fall back to d->id on error. */
@@ -1218,7 +1252,7 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 
 	/* Reuse the snapshot only if it is positioned exactly at the requested cookie;
 	 * anything else (a seek, a second interleaved scan) re-lists. */
-	struct nfsdir *nfsdir;
+	struct nfsdir *nfsdir = NULL;
 	off_t diroffs;
 
 	if ((d->dirCache != NULL) && (d->dirOffs == offs)) {
@@ -1232,8 +1266,10 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		nfs_dirDrop(fs, fs->scanNode);
 
 		int rc = nfs_opendir(fs->nfs, d->path, &nfsdir);
-		if (rc != 0) {
-			return nfs_err(rc);
+		/* The handle is now persisted on the node, so a success return with a
+		 * NULL dir would be dereferenced by a LATER call, not this one. */
+		if ((rc != 0) || (nfsdir == NULL)) {
+			return (rc != 0) ? nfs_err(rc) : -EIO;
 		}
 		d->dirCache = nfsdir;
 		fs->scanNode = d;
