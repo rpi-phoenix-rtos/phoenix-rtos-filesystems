@@ -176,8 +176,9 @@ static int wait_for_dhcp_lease(char *ip_out, size_t cap, int timeout_ms)
 				}
 
 				if (strcmp(key, "up") == 0) {
-					strncpy(cur_if, ifname, sizeof(cur_if) - 1);
-					cur_if[sizeof(cur_if) - 1] = '\0';
+					/* snprintf, not strncpy + manual NUL: same truncating copy, but
+					 * gcc does not warn about it and the bound is not off by one. */
+					(void)snprintf(cur_if, sizeof(cur_if), "%s", ifname);
 					cur_up = (atoi(val) != 0);
 				}
 				else if (strcmp(key, "ip") == 0) {
