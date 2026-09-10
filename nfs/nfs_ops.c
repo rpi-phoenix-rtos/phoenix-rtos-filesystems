@@ -1137,6 +1137,18 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	nfs_attrDrop(d); /* directory mtime/nlink moved */
 	nfs_dirDrop(fs, d); /* ... and its listing still has the removed name in it */
 
+	/* st_nlink moved for EVERY name of that inode, not just this one. Dropping
+	 * only the unlinked node (below) left a sibling hard link answering stat()
+	 * from its own cache with the pre-unlink count for up to NFS_ATTR_TTL_US --
+	 * a wrong answer, and an intermittent one, since whether it shows depends on
+	 * where the 100 ms TTL happens to fall. nfs_ops_link() already dropped the
+	 * target for exactly this reason ("st_nlink moved"); unlink needs the
+	 * matching sweep. `st` is the pre-unlink don't-follow stat above, so
+	 * st.nfs_ino is the inode whose count just changed. */
+	if (rc == 0) {
+		nfs_node_attrDropByIno(&fs->nodes, st.nfs_ino);
+	}
+
 	/* Drop any cached node for this path (find-only: don't materialize one). */
 	nfs_node_t *n = nfs_node_findPath(&fs->nodes, path);
 	free(path);
@@ -1182,10 +1194,20 @@ int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid)
 		return -ENOENT;
 	}
 
+	/* Capture the inode before dropping, so the sibling sweep below can still
+	 * see which one it was. */
+	uint64_t ino = (target->attrValid != 0) ? target->attr.nfs_ino : 0;
+
 	int rc = nfs_link(fs->nfs, target->path, path);
 	free(path);
 	nfs_attrDrop(d);      /* directory mtime moved */
 	nfs_attrDrop(target); /* st_nlink moved */
+	/* ... and it moved for the inode's OTHER names too. Only possible when we
+	 * had the inode cached; with nothing cached there is nothing stale to drop
+	 * for the named node anyway, and any sibling will have its own TTL. */
+	if ((rc == 0) && (ino != 0)) {
+		nfs_node_attrDropByIno(&fs->nodes, ino);
+	}
 
 	return (rc != 0) ? nfs_err(rc) : 0;
 }

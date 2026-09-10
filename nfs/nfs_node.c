@@ -221,6 +221,28 @@ nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t)
 }
 
 
+void nfs_node_attrDropByIno(nfs_nodeTree_t *t, uint64_t ino)
+{
+	if ((t->byId.root == NULL) || (ino == 0)) {
+		return;
+	}
+
+	for (rbnode_t *it = lib_rbMinimum(t->byId.root); it != NULL; it = lib_rbNext(it)) {
+		nfs_node_t *n = lib_treeof(nfs_node_t, idLinkage, it);
+
+		if (n->attrValid == 0) {
+			continue; /* nothing cached to be stale */
+		}
+		if (n->mnt.port != 0) {
+			continue; /* spliced special file: its nfs_ino is a local node id */
+		}
+		if (n->attr.nfs_ino == ino) {
+			n->attrValid = 0;
+		}
+	}
+}
+
+
 void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
 {
 	if (t->byId.root == NULL) {

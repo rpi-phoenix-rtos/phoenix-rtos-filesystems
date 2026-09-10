@@ -137,6 +137,19 @@ extern nfs_node_t *nfs_node_idleLru(nfs_nodeTree_t *t);
  * attribute: the reclaim implies we lost track of what the server did meanwhile. */
 extern void nfs_node_invalidateHandles(nfs_nodeTree_t *t);
 
+/* Drop the cached attributes of EVERY node whose cached stat claims inode `ino`.
+ *
+ * An operation that changes an inode's link count changes it for every name the
+ * inode has, not just the name the caller passed. Dropping only the named node
+ * leaves the other hard links serving a stale st_nlink until the attribute TTL
+ * expires -- which is a real, and intermittent, wrong answer.
+ *
+ * Nodes with mnt.port != 0 are skipped: a spliced special file has no file on the
+ * export and nfs_refreshStat() synthesises its nfs_ino from the node id, so its
+ * "inode" is not comparable with a server one. */
+extern void nfs_node_attrDropByIno(nfs_nodeTree_t *t, uint64_t ino);
+
+
 /* Join a parent directory path and a single name component into a freshly
  * malloc'd canonical export-relative path. Caller frees. Returns NULL on OOM. */
 extern char *nfs_node_joinPath(const char *parent, const char *name);
