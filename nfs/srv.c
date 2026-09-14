@@ -96,7 +96,59 @@ static struct {
 	char __attribute__((aligned(8))) loopStack[NFS_STACKSZ];
 	char __attribute__((aligned(8))) mountStack[NFS_STACKSZ];
 	char __attribute__((aligned(8))) renewStack[NFS_RENEW_STACKSZ];
+#ifdef NFS_MSG_TICK
+	char __attribute__((aligned(8))) wedgeStack[NFS_RENEW_STACKSZ];
+#endif
 } common;
+
+
+#ifdef NFS_MSG_TICK
+#define NFS_MSG_RING 24
+static volatile char nfs_msgRing[NFS_MSG_RING];
+static volatile unsigned int nfs_msgSeq;
+
+/* Reports when the single-threaded msgRecv loop stops advancing. Runs in its own
+ * thread on purpose: the loop being wedged is exactly the case to report, so the
+ * reporter cannot live in it. debug() is a raw syscall -- no stdio, no malloc --
+ * so it works even when the rest of the process is stuck. One shot. */
+static void nfs_wedgeThread(void *arg)
+{
+	unsigned int last = 0, now;
+	int quiet = 0, reported = 0;
+	char buf[NFS_MSG_RING + 2];
+	unsigned int i, n;
+
+	/* Prove the thread is running. Without this a silent bench is ambiguous
+	 * between "the loop never wedged" and "the watchdog never ran", and this
+	 * investigation has produced several false zeros of exactly that shape. */
+	debug("nfs-fs: wedge watchdog armed\n");
+
+	for (;;) {
+		sleep(2);
+		now = nfs_msgSeq;
+		if ((now == last) && (now != 0u)) {
+			quiet++;
+			if ((quiet >= 5) && (reported == 0)) { /* ~10 s with no message taken */
+				reported = 1;
+				n = (now < NFS_MSG_RING) ? now : NFS_MSG_RING;
+				for (i = 0; i < n; i++) {
+					buf[i] = nfs_msgRing[(now - n + i) % NFS_MSG_RING];
+				}
+				buf[n] = '\n';
+				buf[n + 1] = '\0';
+				debug("nfs-fs: WEDGE, last ops: ");
+				debug(buf);
+			}
+		}
+		else {
+			quiet = 0;
+			last = now;
+		}
+	}
+}
+#endif
+
+
 
 
 static int valid_ipv4(const char *s)
@@ -279,31 +331,35 @@ static void nfs_loopThread(void *arg)
 		 * system and stopped reproducing the fault at all. '^' occurs 0 times in
 		 * a real boot log (counted, not guessed). */
 		{
-			/* Encode WHICH operation was just taken off the port: the server is
-			 * single-threaded, so the LAST mark before the log goes silent names
-			 * the handler that never returned. */
-			char tk[3] = { '^', '?', '\0' };
+			/* Two stores, no syscall. The previous version called debug() per
+			 * message (~2000 per boot) and was heavy enough that 20 amplified
+			 * trials caught no event at all -- every denser instrument in this
+			 * hunt has caught fewer. The ring is read out by nfs_wedgeThread,
+			 * which is a SEPARATE thread and therefore still runs when this
+			 * single-threaded loop is stuck inside a handler. */
+			char c;
 
 			switch (msg.type) {
-				case mtOpen: tk[1] = 'O'; break;
-				case mtClose: tk[1] = 'C'; break;
-				case mtRead: tk[1] = 'R'; break;
-				case mtWrite: tk[1] = 'W'; break;
-				case mtTruncate: tk[1] = 'T'; break;
-				case mtDevCtl: tk[1] = 'D'; break;
-				case mtCreate: tk[1] = 'N'; break;
-				case mtDestroy: tk[1] = 'X'; break;
-				case mtSetAttr: tk[1] = 'S'; break;
-				case mtGetAttr: tk[1] = 'G'; break;
-				case mtGetAttrAll: tk[1] = 'A'; break;
-				case mtLookup: tk[1] = 'L'; break;
-				case mtLink: tk[1] = 'K'; break;
-				case mtUnlink: tk[1] = 'U'; break;
-				case mtReaddir: tk[1] = 'E'; break;
-				case mtStat: tk[1] = 'F'; break;
-				default: break;
+				case mtOpen: c = 'O'; break;
+				case mtClose: c = 'C'; break;
+				case mtRead: c = 'R'; break;
+				case mtWrite: c = 'W'; break;
+				case mtTruncate: c = 'T'; break;
+				case mtDevCtl: c = 'D'; break;
+				case mtCreate: c = 'N'; break;
+				case mtDestroy: c = 'X'; break;
+				case mtSetAttr: c = 'S'; break;
+				case mtGetAttr: c = 'G'; break;
+				case mtGetAttrAll: c = 'A'; break;
+				case mtLookup: c = 'L'; break;
+				case mtLink: c = 'K'; break;
+				case mtUnlink: c = 'U'; break;
+				case mtReaddir: c = 'E'; break;
+				case mtStat: c = 'F'; break;
+				default: c = '?'; break;
 			}
-			debug(tk);
+			nfs_msgRing[nfs_msgSeq % NFS_MSG_RING] = c;
+			nfs_msgSeq++;
 		}
 #endif
 
@@ -568,6 +624,9 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 
 	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
 	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
+#ifdef NFS_MSG_TICK
+	beginthread(nfs_wedgeThread, 4, common.wedgeStack, sizeof(common.wedgeStack), NULL);
+#endif
 
 	for (;;) {
 		usleep(1000000);
@@ -733,6 +792,9 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 
 	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
 	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
+#ifdef NFS_MSG_TICK
+	beginthread(nfs_wedgeThread, 4, common.wedgeStack, sizeof(common.wedgeStack), NULL);
+#endif
 
 	/* Path 1: try the proven mtSetAttr(atDev) splice onto the existing "/". */
 	oid_t oldRoot;
@@ -882,6 +944,9 @@ int main(int argc, char **argv)
 
 	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
 	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
+#ifdef NFS_MSG_TICK
+	beginthread(nfs_wedgeThread, 4, common.wedgeStack, sizeof(common.wedgeStack), NULL);
+#endif
 
 	/* The two worker threads run forever; park the main thread. */
 	for (;;) {
