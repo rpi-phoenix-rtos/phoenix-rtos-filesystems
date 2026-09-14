@@ -111,17 +111,42 @@ static volatile unsigned int nfs_msgSeq;
  * thread on purpose: the loop being wedged is exactly the case to report, so the
  * reporter cannot live in it. debug() is a raw syscall -- no stdio, no malloc --
  * so it works even when the rest of the process is stuck. One shot. */
-static void nfs_wedgeThread(void *arg)
+/* The report path, factored out so the SELF-TEST below exercises exactly the code
+ * that runs on a real wedge -- not a copy of it. An instrument that has never been
+ * seen to fire cannot be read as evidence when it stays silent, and this hunt has
+ * produced several false zeros of precisely that shape. */
+static void nfs_wedgeReport(const char *tag, unsigned int upto)
 {
-	unsigned int last = 0, now;
-	int quiet = 0, reported = 0;
 	char buf[NFS_MSG_RING + 2];
 	unsigned int i, n;
+
+	n = (upto < NFS_MSG_RING) ? upto : NFS_MSG_RING;
+	for (i = 0; i < n; i++) {
+		buf[i] = nfs_msgRing[(upto - n + i) % NFS_MSG_RING];
+	}
+	buf[n] = '\n';
+	buf[n + 1] = '\0';
+	debug(tag);
+	debug(buf);
+}
+
+
+static void nfs_wedgeThread(void *arg)
+{
+	unsigned int last = 0, now, n_selftest;
+	int quiet = 0, reported = 0;
 
 	/* Prove the thread is running. Without this a silent bench is ambiguous
 	 * between "the loop never wedged" and "the watchdog never ran", and this
 	 * investigation has produced several false zeros of exactly that shape. */
 	debug("nfs-fs: wedge watchdog armed\n");
+
+	/* SELF-TEST: drive the real report path once, with a known ring, so its
+	 * output format and reachability are proven before any silence is trusted. */
+	for (n_selftest = 0; n_selftest < NFS_MSG_RING; n_selftest++) {
+		nfs_msgRing[n_selftest] = (char)('a' + (n_selftest % 26));
+	}
+	nfs_wedgeReport("nfs-fs: WEDGE-SELFTEST last ops: ", NFS_MSG_RING);
 
 	for (;;) {
 		sleep(2);
@@ -130,14 +155,7 @@ static void nfs_wedgeThread(void *arg)
 			quiet++;
 			if ((quiet >= 5) && (reported == 0)) { /* ~10 s with no message taken */
 				reported = 1;
-				n = (now < NFS_MSG_RING) ? now : NFS_MSG_RING;
-				for (i = 0; i < n; i++) {
-					buf[i] = nfs_msgRing[(now - n + i) % NFS_MSG_RING];
-				}
-				buf[n] = '\n';
-				buf[n + 1] = '\0';
-				debug("nfs-fs: WEDGE, last ops: ");
-				debug(buf);
+				nfs_wedgeReport("nfs-fs: WEDGE, last ops: ", now);
 			}
 		}
 		else {
