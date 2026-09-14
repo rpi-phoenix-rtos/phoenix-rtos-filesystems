@@ -66,6 +66,10 @@
 #define NFS_V4 4
 #endif
 
+#ifdef NFS_MSG_TICK
+#include <sys/debug.h>
+#endif
+
 #define LOG(fmt, ...) printf("nfs-fs: " fmt, ##__VA_ARGS__)
 
 /* 16 * _PAGE_SIZE = 64 KB; the deep NFS handler call chain overflows the 8 KB
@@ -260,6 +264,22 @@ static void nfs_loopThread(void *arg)
 		if (msgRecv(fs->port, &msg, &rid) < 0) {
 			continue;
 		}
+
+#ifdef NFS_MSG_TICK
+		/* DIAGNOSTIC (-DNFS_MSG_TICK): the `premain-hang` bisect ends in an open()
+		 * that never returns, and THIS SERVER IS SINGLE-THREADED -- one msgRecv
+		 * loop -- so a handler that blocks stops every later open() dead. One
+		 * character per received message says which it is, during a hang:
+		 *   ticks continue -> the server is alive and taking requests; the stall
+		 *                     is our request or its reply
+		 *   ticks stop     -> the server is wedged inside a handler, and every
+		 *                     other process asking it for anything hangs too
+		 * Server-side on purpose: it perturbs the server, not the racing child,
+		 * unlike a kernel-side watchdog which changed every proc_send in the
+		 * system and stopped reproducing the fault at all. '^' occurs 0 times in
+		 * a real boot log (counted, not guessed). */
+		debug("^");
+#endif
 
 		switch (msg.type) {
 			case mtOpen:

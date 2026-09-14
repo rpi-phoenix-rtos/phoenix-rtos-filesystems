@@ -28,5 +28,9 @@ LOCAL_LDLIBS := -lnfs
 # and NUL-terminates afterwards; -Wstringop-truncation flags the intentional
 # no-trailing-NUL strncpy under -Werror. Downgrade just that one diagnostic
 # (same as nfs-smoke's Makefile).
-LOCAL_CFLAGS := -Wno-error=stringop-truncation
+# FS_DIAG is a diagnostic -D hook for this server only (mirrors KERNEL_DIAG /
+# LIBC_DIAG), e.g. FS_DIAG='-DNFS_MSG_TICK'. It must be APPENDED here rather
+# than assigned earlier: this line is the last LOCAL_CFLAGS before
+# include $(binary.mk) and a plain := earlier in the file is silently clobbered.
+LOCAL_CFLAGS := -Wno-error=stringop-truncation $(FS_DIAG)
 include $(binary.mk)
