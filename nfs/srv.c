@@ -278,7 +278,33 @@ static void nfs_loopThread(void *arg)
 		 * unlike a kernel-side watchdog which changed every proc_send in the
 		 * system and stopped reproducing the fault at all. '^' occurs 0 times in
 		 * a real boot log (counted, not guessed). */
-		debug("^");
+		{
+			/* Encode WHICH operation was just taken off the port: the server is
+			 * single-threaded, so the LAST mark before the log goes silent names
+			 * the handler that never returned. */
+			char tk[3] = { '^', '?', '\0' };
+
+			switch (msg.type) {
+				case mtOpen: tk[1] = 'O'; break;
+				case mtClose: tk[1] = 'C'; break;
+				case mtRead: tk[1] = 'R'; break;
+				case mtWrite: tk[1] = 'W'; break;
+				case mtTruncate: tk[1] = 'T'; break;
+				case mtDevCtl: tk[1] = 'D'; break;
+				case mtCreate: tk[1] = 'N'; break;
+				case mtDestroy: tk[1] = 'X'; break;
+				case mtSetAttr: tk[1] = 'S'; break;
+				case mtGetAttr: tk[1] = 'G'; break;
+				case mtGetAttrAll: tk[1] = 'A'; break;
+				case mtLookup: tk[1] = 'L'; break;
+				case mtLink: tk[1] = 'K'; break;
+				case mtUnlink: tk[1] = 'U'; break;
+				case mtReaddir: tk[1] = 'E'; break;
+				case mtStat: tk[1] = 'F'; break;
+				default: break;
+			}
+			debug(tk);
+		}
 #endif
 
 		switch (msg.type) {
