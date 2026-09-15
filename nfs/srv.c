@@ -104,6 +104,11 @@ static struct {
 
 #ifdef NFS_MSG_TICK
 #define NFS_MSG_RING 24
+/* Re-report while the loop stays wedged, rather than once. One report cannot
+ * tell a blocked call from a slow one; a value that is still identical several
+ * reports later is proof. That is what localised the premain-hang deadlock --
+ * a mark frozen at the same step, on the same iteration, for 80 s. */
+#define NFS_WEDGE_REPORTS 8
 static volatile char nfs_msgRing[NFS_MSG_RING];
 static volatile unsigned int nfs_msgSeq;
 
@@ -187,8 +192,9 @@ static void nfs_wedgeThread(void *arg)
 		now = nfs_msgSeq;
 		if ((now == last) && (now != 0u)) {
 			quiet++;
-			if ((quiet >= 5) && (reported == 0)) { /* ~10 s with no message taken */
-				reported = 1;
+			if ((quiet >= 5) && (reported < NFS_WEDGE_REPORTS)) { /* ~10 s with no message taken */
+				reported++;
+				quiet = 0;
 				nfs_wedgeReport("nfs-fs: WEDGE, last ops: ", now);
 			}
 		}
