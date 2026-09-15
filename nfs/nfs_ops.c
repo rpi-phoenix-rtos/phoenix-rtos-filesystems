@@ -474,6 +474,14 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 }
 
 
+#ifdef NFS_MSG_TICK
+/* Read by the wedge watchdog in srv.c; see nfs_ops_open(). */
+volatile unsigned int nfs_openIter;
+volatile int nfs_openRc = 0x7fffffff; /* sentinel: nfs_open has not returned yet */
+volatile int nfs_openPhase = -1;      /* -1 not in open, 0 stat, 1 in nfs_open, 2 returned */
+#endif
+
+
 int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 {
 	nfs_node_t *n = nfs_node_find(&fs->nodes, oid->id);
@@ -497,6 +505,9 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 	/* Re-stat on open so a redeployed file isn't shadowed (OQ-B) — force, since
 	 * answering this from the attribute cache would defeat its whole purpose. */
 	struct nfs_stat_64 st;
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 0; /* entered nfs_ops_open, about to re-stat */
+#endif
 	int rc = nfs_refreshStat(fs, n, &st, 1);
 	if (rc != 0) {
 		return rc;
@@ -507,7 +518,20 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 		int reclaimBudget = NFS_RECLAIM_MAX;
 		struct nfsfh *fh = NULL;
 		for (;;) {
+#ifdef NFS_MSG_TICK
+			/* Two stores. The wedge watchdog in srv.c prints these, and they
+			 * separate the two ways this handler can fail to return:
+			 *   iter small, rc unset -> stuck INSIDE one nfs_open RPC, which is
+			 *                           a synchronous libnfs call with no timeout
+			 *   iter large           -> spinning in this retry loop instead */
+			nfs_openIter++;
+			nfs_openPhase = 1;
+#endif
 			rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
+#ifdef NFS_MSG_TICK
+			nfs_openPhase = 2;
+			nfs_openRc = rc;
+#endif
 			if (rc != 0) {
 				/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
 				 * errors — this open is on the exec path, so a transient failure here is a prime

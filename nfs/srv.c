@@ -115,6 +115,32 @@ static volatile unsigned int nfs_msgSeq;
  * that runs on a real wedge -- not a copy of it. An instrument that has never been
  * seen to fire cannot be read as evidence when it stays silent, and this hunt has
  * produced several false zeros of precisely that shape. */
+extern volatile unsigned int nfs_openIter;
+extern volatile int nfs_openRc;
+extern volatile int nfs_openPhase;
+
+
+/* Minimal signed-decimal formatter: debug() takes a string and this runs when the
+ * process may be wedged, so no stdio. */
+static void nfs_wedgeNum(const char *label, int v)
+{
+	char b[16];
+	unsigned int u = (v < 0) ? (unsigned int)(-v) : (unsigned int)v;
+	int i = (int)sizeof(b) - 1;
+
+	b[i--] = '\0';
+	do {
+		b[i--] = (char)('0' + (u % 10u));
+		u /= 10u;
+	} while ((u != 0u) && (i > 0));
+	if (v < 0) {
+		b[i--] = '-';
+	}
+	debug(label);
+	debug(&b[i + 1]);
+}
+
+
 static void nfs_wedgeReport(const char *tag, unsigned int upto)
 {
 	char buf[NFS_MSG_RING + 2];
@@ -128,6 +154,14 @@ static void nfs_wedgeReport(const char *tag, unsigned int upto)
 	buf[n + 1] = '\0';
 	debug(tag);
 	debug(buf);
+	/* Which phase of nfs_ops_open() it is sitting in, if any. NFS_RECLAIM_MAX is
+	 * 2, so the retry loop is bounded at roughly 30 s -- a large iter would mean
+	 * the loop, a small one with phase 1 means a single nfs_open RPC that never
+	 * returned. */
+	nfs_wedgeNum("nfs-fs:   open phase=", nfs_openPhase);
+	nfs_wedgeNum(" iter=", (int)nfs_openIter);
+	nfs_wedgeNum(" rc=", nfs_openRc);
+	debug("\n");
 }
 
 

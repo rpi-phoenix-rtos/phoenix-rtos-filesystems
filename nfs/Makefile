@@ -8,6 +8,11 @@
 
 LOCAL_PATH := $(call my-dir)
 
+# FS_DIAG must reach BOTH targets: nfs_ops.c compiles into this static library,
+# and srv.c references symbols it defines under the flag. Setting it only on the
+# binary target below leaves those symbols undefined and the link fails.
+LOCAL_CFLAGS := $(FS_DIAG)
+
 NAME := libnfsfs
 SRCS := $(filter-out $(LOCAL_PATH)srv.c, $(wildcard $(LOCAL_PATH)*.c))
 HEADERS := $(LOCAL_PATH)nfs_ops.h $(LOCAL_PATH)nfs_node.h
