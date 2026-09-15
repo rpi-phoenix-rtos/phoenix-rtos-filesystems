@@ -298,11 +298,24 @@ static int nfs_reclaim(nfs_fs_t *fs)
 }
 
 
-/* If rc is a recoverable NFSv4 state expiry and reclaim budget remains, rebuild
- * the client and return 1 (caller should retry the op); otherwise return 0. */
+/* Is rc a failure a fresh client would not repeat?
+ *
+ * Two shapes qualify. An NFSv4 state expiry (above) is the server having
+ * discarded our client state. -ETIMEDOUT is our libnfs patch
+ * (ports/libnfs/patches/04-sync-call-overall-deadline.patch) giving up on a sync
+ * call the server never answered; it disconnects on the way out, so that context
+ * is finished either way and only a rebuild can make progress. */
+static int nfs_isRecoverable(nfs_fs_t *fs, int rc)
+{
+	return (rc == -ETIMEDOUT) || (nfs_isStateExpiry(fs, rc) != 0);
+}
+
+
+/* If rc is recoverable and reclaim budget remains, rebuild the client and return
+ * 1 (caller should retry the op); otherwise return 0. */
 static int nfs_tryReclaim(nfs_fs_t *fs, int rc, int *budget)
 {
-	if ((*budget <= 0) || (nfs_isStateExpiry(fs, rc) == 0)) {
+	if ((*budget <= 0) || (nfs_isRecoverable(fs, rc) == 0)) {
 		return 0;
 	}
 	(*budget)--;
@@ -332,11 +345,13 @@ int nfs_ops_renew(nfs_fs_t *fs)
 	nfs_openPhase = 22;
 #endif
 
-	/* Renew failed. If the lease has already lapsed, reclaim now so the next
-	 * open() doesn't have to; any other (e.g. transient) failure is left for the
-	 * next tick / the per-op reclaim safety net. */
-	if (nfs_isStateExpiry(fs, rc) != 0) {
-		printf("nfs-fs: renew found lease expired, reclaiming\n");
+	/* Renew failed. Reclaim now, so the next open() doesn't have to, if either
+	 * the lease has already lapsed or the RENEW itself timed out -- the latter
+	 * leaves the context disconnected, so every later op would fail on it. Any
+	 * other (e.g. transient) failure is left for the next tick / the per-op
+	 * reclaim safety net. */
+	if (nfs_isRecoverable(fs, rc) != 0) {
+		printf("nfs-fs: renew failed (%d), reclaiming client state\n", rc);
 		return nfs_reclaim(fs);
 	}
 	return rc;
