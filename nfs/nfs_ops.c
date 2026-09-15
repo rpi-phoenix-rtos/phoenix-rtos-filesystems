@@ -241,13 +241,29 @@ static int nfs_isStateExpiry(nfs_fs_t *fs, int rc)
  * op re-opens by path. Runs on the loop thread (no concurrent libnfs access).
  * Returns 0 on success, -errno on failure (the old context is kept on failure so
  * the caller can still surface the original error). */
+#ifdef NFS_MSG_TICK
+/* Forward declarations: the definitions sit next to nfs_ops_open() below, but
+ * nfs_reclaim() -- which the open path calls on NFSv4 state expiry -- is earlier
+ * in the file and sets these too. */
+extern volatile unsigned int nfs_openIter;
+extern volatile int nfs_openRc;
+extern volatile int nfs_openPhase;
+#endif
+
+
 static int nfs_reclaim(nfs_fs_t *fs)
 {
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 3; /* entered reclaim */
+#endif
 	struct nfs_context *fresh = nfs_makeContext(fs->version);
 	if (fresh == NULL) {
 		return -ENOMEM;
 	}
 
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 4; /* fresh context built; about to re-mount */
+#endif
 	if (nfs_mount(fresh, fs->server, fs->export) != 0) {
 		printf("nfs-fs: reclaim re-mount %s:%s failed: %s\n", fs->server, fs->export, nfs_get_error(fresh));
 		nfs_destroy_context(fresh);
@@ -261,6 +277,9 @@ static int nfs_reclaim(nfs_fs_t *fs)
 	 * nfs_destroy_context only walks the dircache list, which we keep empty, so
 	 * dropping the pointer instead would strand the snapshot and every strdup'd
 	 * name in it (tens of KB for a large directory) on every reclaim. */
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 5; /* re-mount returned OK */
+#endif
 	nfs_dirDrop(fs, fs->scanNode);
 
 	struct nfs_context *old = fs->nfs;
@@ -271,6 +290,9 @@ static int nfs_reclaim(nfs_fs_t *fs)
 	nfs_node_invalidateHandles(&fs->nodes);
 	nfs_destroy_context(old);
 
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 6; /* reclaim complete */
+#endif
 	printf("nfs-fs: reclaimed NFSv4 client state (re-mounted %s:%s)\n", fs->server, fs->export);
 	return 0;
 }
@@ -537,6 +559,9 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 				 * errors — this open is on the exec path, so a transient failure here is a prime
 				 * cause of the intermittent exec -5. */
 				for (int tries = 0; tries < 25; tries++) {
+#ifdef NFS_MSG_TICK
+					nfs_openPhase = 10 + tries; /* inside the read-only retry loop */
+#endif
 					rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
 					if ((rc == 0) || !nfs_transient(rc)) {
 						break;
