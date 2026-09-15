@@ -312,10 +312,25 @@ static int nfs_tryReclaim(nfs_fs_t *fs, int rc, int *budget)
 
 int nfs_ops_renew(nfs_fs_t *fs)
 {
+#ifdef NFS_MSG_TICK
+	/* The forced-expiry reproducer wedges with the ring's last entry '?', which is
+	 * this self-sent RENEW message, and with the open-path phases still stale from
+	 * the previous successful open -- so the stall is in here, not in the open
+	 * path. 20/21 bracket the renewal RPC itself; 22 is past the expiry check. */
+	nfs_openPhase = 20;
+#endif
 	int rc = nfs_renew(fs->nfs);
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 21;
+	nfs_openRc = rc;
+#endif
 	if (rc == 0) {
 		return 0;
 	}
+
+#ifdef NFS_MSG_TICK
+	nfs_openPhase = 22;
+#endif
 
 	/* Renew failed. If the lease has already lapsed, reclaim now so the next
 	 * open() doesn't have to; any other (e.g. transient) failure is left for the
