@@ -21,16 +21,32 @@
 #include "inode.h"
 
 
+/* ⚠ The byte offset MUST be computed in 64 bits.
+ *
+ * `bno` and `fs->blocksz` are both uint32_t, so `bno * fs->blocksz` is evaluated
+ * in 32-bit arithmetic and WRAPS AT 4 GiB -- long before the result is widened
+ * to the off_t the read/write callback takes. Every ext2 filesystem larger than
+ * 4 GiB therefore read and wrote the wrong place, silently.
+ *
+ * Found 2026-09-20 on a 27.5 GiB ext2 USB partition: `ls` listed the root
+ * directory correctly (low blocks) while a top-level directory in it would not
+ * stat as a directory, because the Orlov allocator had put its inode in a block
+ * group past the wrap. A 2 GiB partition on the same stick was perfect -- its
+ * highest offset is 0x80000000, which still fits.
+ *
+ * Cast first, then multiply. */
 int ext2_block_read(ext2_t *fs, uint32_t bno, void *buff, uint32_t n)
 {
 	ssize_t size = n * fs->blocksz;
+	off_t offs = (off_t)bno * (off_t)fs->blocksz;
+
 	if (fs->strg != NULL) {
-		if (fs->strg->dev->blk->ops->read(fs->strg, fs->strg->start + bno * fs->blocksz, buff, size) != size) {
+		if (fs->strg->dev->blk->ops->read(fs->strg, fs->strg->start + offs, buff, size) != size) {
 			return -EIO;
 		}
 	}
 	else if (fs->legacy.read != NULL) {
-		if (fs->legacy.read(fs->legacy.devId, bno * fs->blocksz, buff, size) != size) {
+		if (fs->legacy.read(fs->legacy.devId, offs, buff, size) != size) {
 			return -EIO;
 		}
 	}
@@ -45,13 +61,16 @@ int ext2_block_read(ext2_t *fs, uint32_t bno, void *buff, uint32_t n)
 int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n)
 {
 	ssize_t size = n * fs->blocksz;
+	/* 64-bit offset, same reason as ext2_block_read above. */
+	off_t offs = (off_t)bno * (off_t)fs->blocksz;
+
 	if (fs->strg != NULL) {
-		if (fs->strg->dev->blk->ops->write(fs->strg, fs->strg->start + bno * fs->blocksz, buff, size) != size) {
+		if (fs->strg->dev->blk->ops->write(fs->strg, fs->strg->start + offs, buff, size) != size) {
 			return -EIO;
 		}
 	}
 	else if (fs->legacy.write != NULL) {
-		if (fs->legacy.write(fs->legacy.devId, bno * fs->blocksz, buff, size) != size) {
+		if (fs->legacy.write(fs->legacy.devId, offs, buff, size) != size) {
 			return -EIO;
 		}
 	}
