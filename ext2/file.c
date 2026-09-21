@@ -196,6 +196,18 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 
 	/* FIXME: truncation for files with unallocated blocks might fail */
 
+	/* A short symlink keeps its target INSIDE the block array, and a device
+	 * node keeps its rdev there, so those uint32_t are not block numbers.
+	 * Walking them would hand arbitrary values to ext2_block_destroy() and
+	 * free blocks belonging to other files. Neither owns storage to release. */
+	if (EXT2_ISDEV(obj->inode->mode) ||
+			(S_ISLNK(obj->inode->mode) && (obj->inode->size <= MAX_SYMLINK_LEN_IN_INODE))) {
+		obj->inode->size = size;
+		obj->inode->mtime = obj->inode->ctime = time(NULL);
+		obj->flags |= OFLAG_DIRTY;
+		return EOK;
+	}
+
 	if (obj->inode->size > size) {
 		for (block = start; block < end; block++) {
 			if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)

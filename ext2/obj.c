@@ -53,7 +53,19 @@ static int _ext2_obj_remove(ext2_t *fs, ext2_obj_t *obj)
 /* Destroys object */
 static int _ext2_obj_destroy(ext2_t *fs, ext2_obj_t *obj, bool ignoreSync)
 {
-	int err = ext2_inode_destroy(fs, (uint32_t)obj->id, obj->inode->mode);
+	int err;
+
+	/* Give the data blocks back before the inode. Only ext2_destroy() truncated
+	 * first, so a file removed with unlink(2) -- an ordinary `rm` -- released
+	 * its inode and LEAKED every block it held; e2fsck saw whole extents marked
+	 * in use with no owner. Truncating an already empty object is a no-op, so
+	 * the ext2_destroy() path is unchanged. */
+	err = ext2_obj_truncate(fs, obj, 0);
+	if ((err < 0) && (!ignoreSync)) {
+		return err;
+	}
+
+	err = ext2_inode_destroy(fs, (uint32_t)obj->id, obj->inode->mode);
 	if ((err < 0) && (!ignoreSync)) {
 		return err;
 	}
