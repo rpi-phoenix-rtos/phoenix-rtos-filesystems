@@ -35,6 +35,34 @@
  * highest offset is 0x80000000, which still fits.
  *
  * Cast first, then multiply. */
+/* Block number <-> block-bitmap position.
+ *
+ * A group's block bitmap is indexed from the filesystem's FIRST DATA BLOCK,
+ * which ext2 defines as 1 when the block size is 1 KiB and 0 for every larger
+ * block size. The bitmap helpers below take a 1-based bit index, so the two
+ * conversions differ by `fstBlock - 1` -- which is zero only on a 1 KiB
+ * filesystem. Folding that term in by hand is how every block a 4 KiB
+ * filesystem allocated came to be off by one from the bit that was reserved
+ * for it, so keep the conversion in exactly one place. */
+static inline uint32_t ext2_blockToGroup(const ext2_t *fs, uint32_t bno)
+{
+	return (bno - fs->sb->fstBlock) / fs->sb->groupBlocks;
+}
+
+
+static inline uint32_t ext2_blockToOffs(const ext2_t *fs, uint32_t bno)
+{
+	return ((bno - fs->sb->fstBlock) % fs->sb->groupBlocks) + 1;
+}
+
+
+static inline uint32_t ext2_blockFromOffs(const ext2_t *fs, uint32_t group, uint32_t offs)
+{
+	return fs->sb->fstBlock + (group * fs->sb->groupBlocks) + offs - 1;
+}
+
+
+
 int ext2_block_read(ext2_t *fs, uint32_t bno, void *buff, uint32_t n)
 {
 	ssize_t size = n * fs->blocksz;
@@ -84,7 +112,7 @@ int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n)
 
 int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 {
-	uint32_t group = (bno - 1) / fs->sb->groupBlocks;
+	uint32_t group = ext2_blockToGroup(fs, bno);
 	uint32_t i, j, pgroup = group, offset = 0;
 	void *bmp;
 	int err;
@@ -98,8 +126,8 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 	}
 
 	for (i = 0, j = 0; i < n; i++, j++) {
-		group = (bno + i - 1) / fs->sb->groupBlocks;
-		offset = (bno + i - 1) % fs->sb->groupBlocks + 1;
+		group = ext2_blockToGroup(fs, bno + i);
+		offset = ext2_blockToOffs(fs, bno + i);
 
 		if (group != pgroup) {
 			if ((err = ext2_block_write(fs, fs->gdt[pgroup].blockBmp, bmp, 1)) < 0) {
@@ -163,9 +191,10 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 
 
 /* Allocates one new block */
-static int ext2_block_createone(ext2_t *fs, uint32_t bno, uint32_t *res)
+/* Allocates one block, preferring the group that holds inode `ino` (its owner). */
+static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
 {
-	uint32_t group = (bno - 1) / fs->sb->groupInodes;
+	uint32_t group = (ino - 1) / fs->sb->groupInodes;
 	uint32_t offset, pgroup = group;
 	void *bmp;
 	int err;
@@ -211,7 +240,7 @@ static int ext2_block_createone(ext2_t *fs, uint32_t bno, uint32_t *res)
 	}
 
 	fs->sb->freeBlocks--;
-	*res = group * fs->sb->groupBlocks + offset;
+	*res = ext2_blockFromOffs(fs, group, offset);
 	free(bmp);
 
 	return EOK;
@@ -231,8 +260,8 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 
 	uint32_t group, offset;
 	if (lbno != 0) {
-		group = (lbno - 1) / fs->sb->groupBlocks;
-		offset = (lbno - 1) % fs->sb->groupBlocks + 1;
+		group = ext2_blockToGroup(fs, lbno);
+		offset = ext2_blockToOffs(fs, lbno);
 	}
 	else {
 		group = ((uint32_t)obj->id - 1) / fs->sb->groupInodes;
@@ -276,7 +305,7 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 		}
 
 		ext2_togglebit(bmp, offset + nFound);
-		*bno = (group * fs->sb->groupBlocks) + offset + nFound;
+		*bno = ext2_blockFromOffs(fs, group, offset + nFound);
 	}
 
 	if (nFound == 0) {
@@ -538,8 +567,8 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 /* Destroys a block */
 static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 {
-	uint32_t group = (bno - 1) / fs->sb->groupBlocks;
-	uint32_t offset = (bno - 1) % fs->sb->groupBlocks + 1;
+	uint32_t group = ext2_blockToGroup(fs, bno);
+	uint32_t offset = ext2_blockToOffs(fs, bno);
 	void *bmp;
 	int err;
 
