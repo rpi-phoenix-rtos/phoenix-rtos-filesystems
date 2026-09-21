@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -304,9 +305,28 @@ void ext2_objs_destroy(ext2_t *fs)
 
 	mutexLock(fs->objs->lock);
 
-	for (node = lib_rbMinimum(fs->objs->used.root); node; node = next) {
+	for (node = lib_rbMinimum(fs->objs->used.root); node != NULL; node = next) {
+		ext2_obj_t *obj = lib_treeof(ext2_obj_t, node, node);
+
 		next = lib_rbNext(node);
-		_ext2_obj_destroy(fs, lib_treeof(ext2_obj_t, node, node), true);
+
+		/* Tearing the filesystem down releases the in-memory objects; it must
+		 * NOT delete the files they stand for. _ext2_obj_destroy() frees the
+		 * ON-DISK inode, and `ignoreSync` only suppresses the error it returns,
+		 * so unmounting marked every still-cached inode free -- the root
+		 * directory, lost+found and anything touched since the mount.
+		 *
+		 * An inode with no links left is the one real exception: that is a file
+		 * unlinked while still open, whose on-disk release was deferred until
+		 * the last reference went away, and this is the last reference. */
+		if (obj->inode->links == 0) {
+			(void)_ext2_obj_destroy(fs, obj, true);
+		}
+		else {
+			(void)ext2_obj_sync(fs, obj);
+			(void)_ext2_obj_remove(fs, obj);
+			free(obj);
+		}
 	}
 
 	mutexUnlock(fs->objs->lock);
