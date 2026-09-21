@@ -174,8 +174,9 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 	fs->gdt[group].freeBlocks += j;
 
 	if ((err = ext2_gdt_syncone(fs, group)) < 0) {
-		/* TEMPORARY: this handler RE-MARKS every block used and writes the
-		 * bitmap back. If it runs, it silently undoes the free above. */
+		/* Roll the free back: re-mark every block used and write the bitmap
+		 * again, so a failed descriptor sync does not leave blocks that the
+		 * bitmap calls free but the group counts still call used. */
 		for (i = 0; i < j; i++)
 			ext2_togglebit(bmp, offset--);
 
