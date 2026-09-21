@@ -93,7 +93,11 @@ int ext2_inode_destroy(ext2_t *fs, uint32_t ino, uint16_t mode)
 	void *bmp;
 	int err;
 
-	if (((fs->root != NULL) && (ino < (uint32_t)fs->root->id)) || (ino > fs->sb->inodes))
+	/* Inodes 1..10 are reserved by ext2 (root is 2; the first inode a file may
+	 * use is 11). Freeing one corrupts the filesystem, so refuse rather than
+	 * trust the caller -- the old test only rejected inode 1, which let a
+	 * mistaken caller mark the root directory available for reallocation. */
+	if ((ino < EXT2_FIRST_INO) || (ino > fs->sb->inodes))
 		return -EINVAL;
 
 	if ((bmp = malloc(fs->blocksz)) == NULL)

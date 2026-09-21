@@ -22,6 +22,9 @@
 
 
 /* Inode blocks */
+#define EXT2_ROOT_INO 2u  /* Root directory inode */
+#define EXT2_FIRST_INO 11u /* First inode a regular file may use; 1..10 are reserved */
+
 #define DIRECT_BLOCKS 12                                   /* Number of direct blocks */
 #define SINGLE_INDIRECT_BLOCK DIRECT_BLOCKS                /* Single indirect block */
 #define DOUBLE_INDIRECT_BLOCK (SINGLE_INDIRECT_BLOCK + 1)  /* Double indirect block */

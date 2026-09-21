@@ -96,8 +96,14 @@ static int _ext2_obj_create(ext2_t *fs, uint32_t pino, ext2_inode_t *inode, uint
 	ext2_obj_t *obj;
 	uint32_t ino;
 	int err;
+	/* Did THIS call allocate the on-disk inode? Only then may the error path
+	 * give it back. ext2_obj_get() calls us with an existing inode to pull it
+	 * into the object cache, and there `ino` names a live file -- freeing it
+	 * marks a directory that is still referenced as available, and the next
+	 * allocation hands the same number out again. */
+	const bool allocated = (inode == NULL);
 
-	if (inode == NULL) {
+	if (allocated) {
 		if (!(ino = ext2_inode_create(fs, pino, mode)))
 			return -ENOSPC;
 
@@ -144,8 +150,12 @@ static int _ext2_obj_create(ext2_t *fs, uint32_t pino, ext2_inode_t *inode, uint
 		return EOK;
 	} while (0);
 
+	/* The object takes ownership of `inode` on success, so freeing it here is
+	 * right either way; releasing the inode NUMBER is not (see `allocated`). */
 	free(inode);
-	ext2_inode_destroy(fs, ino, mode);
+	if (allocated) {
+		ext2_inode_destroy(fs, ino, mode);
+	}
 
 	return err;
 }
