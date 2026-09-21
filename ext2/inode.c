@@ -229,7 +229,20 @@ uint32_t ext2_inode_create(ext2_t *fs, uint32_t pino, uint16_t mode)
 		return 0;
 	}
 
-	if (!(ino = ext2_findzerobit(bmp, fs->sb->groupInodes, 0))) {
+	ino = ext2_findzerobit(bmp, fs->sb->groupInodes, 0);
+
+	/* TEMPORARY (inode-corruption hunt, 2026-09-21). One touch on a 27.5 GiB
+	 * 4 KiB-block ext2 turned lost+found (inode 11) into a 0-byte regular file,
+	 * i.e. an IN-USE inode was handed out. Reading the code cleared the
+	 * inode-table arithmetic, the 1-based bitmap indexing, gdt_syncone's block
+	 * number and gdt_init's block/remainder split, so print what the allocator
+	 * actually sees. On group 0 of a fresh filesystem the first bitmap word must
+	 * be 0x000007ff (inodes 1..11 used) and ino must come back 12. */
+	fprintf(stderr, "ext2: inode_create group=%u ino=%u bmpBlk=%u bmp[0]=%08x bmp[1]=%08x groupInodes=%u blocksz=%u\n",
+		group, ino, fs->gdt[group].inodeBmp, ((uint32_t *)bmp)[0], ((uint32_t *)bmp)[1],
+		fs->sb->groupInodes, fs->blocksz);
+
+	if (ino == 0) {
 		free(bmp);
 		return 0;
 	}
