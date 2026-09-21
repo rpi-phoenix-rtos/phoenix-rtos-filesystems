@@ -748,5 +748,17 @@ int ext2_block_init(ext2_t *fs, ext2_obj_t *obj, uint32_t block, void *buff)
 	if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
 		return err;
 
+	/* An unallocated block is a HOLE, and a hole reads as zeros. Passing
+	 * *bno == 0 to ext2_block_read() instead read block 0 OF THE DEVICE -- the
+	 * boot sector and superblock -- so reading a sparse file's hole returned
+	 * superblock bytes where POSIX requires zeros, and every freshly created
+	 * file's first block began life as a copy of block 0 with only the written
+	 * bytes laid over it. Those stale bytes become visible as soon as the file
+	 * is extended. */
+	if (*bno == 0) {
+		memset(buff, 0, fs->blocksz);
+		return EOK;
+	}
+
 	return ext2_block_read(fs, *bno, buff, 1);
 }
