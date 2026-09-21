@@ -400,6 +400,10 @@ static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int de
 			if ((err = ext2_block_createone(fs, (uint32_t)obj->id, &obj->ind[depth].bno)) < 0)
 				return err;
 
+			/* i_blocks counts a file's metadata blocks as well as its data;
+			 * e2fsck expects the indirect blocks in the total. */
+			obj->inode->blocks += fs->blocksz / fs->sectorsz;
+
 			memset(obj->ind[depth].data, 0, fs->blocksz);
 			*bno = obj->ind[depth].bno;
 		}
@@ -526,6 +530,11 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 			for (; i < j; i += k) {
 				if ((err = ext2_block_create(fs, obj, block + i, lbno, j - i, &k)) < 0)
 					return err;
+
+				/* ext2_block_syncone() accounts for the single-block path; this
+				 * is the bulk one and it did not, so every file written by an
+				 * ordinary buffered write ended up with i_blocks == 0. */
+				obj->inode->blocks += k * (fs->blocksz / fs->sectorsz);
 
 				if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
 					return err;
