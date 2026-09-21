@@ -14,6 +14,8 @@
  */
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -163,6 +165,7 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 		ext2_togglebit(bmp, offset);
 	}
 
+
 	if ((err = ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
 		free(bmp);
 		return err;
@@ -171,6 +174,8 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 	fs->gdt[group].freeBlocks += j;
 
 	if ((err = ext2_gdt_syncone(fs, group)) < 0) {
+		/* TEMPORARY: this handler RE-MARKS every block used and writes the
+		 * bitmap back. If it runs, it silently undoes the free above. */
 		for (i = 0; i < j; i++)
 			ext2_togglebit(bmp, offset--);
 
@@ -380,11 +385,20 @@ static int ext2_block_offs(ext2_t *fs, uint32_t block, uint32_t offs[4])
 
 
 /* Reads an indirect block */
-static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int depth, uint32_t **ind)
+static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int depth, uint32_t **ind, bool alloc)
 {
 	int err;
 
 	depth -= 2;
+
+	/* The truncate path clears these pointers as it frees each indirect block.
+	 * Allocating a replacement for a pointer that has just been zeroed is what
+	 * made every delete churn: free one block, allocate the next, forever. Only
+	 * the WRITE path may create an indirect block. */
+	if (!(*bno) && !alloc) {
+		*ind = NULL;
+		return EOK;
+	}
 
 	if (!(*bno) || (*bno != obj->ind[depth].bno)) {
 		if (obj->ind[depth].data == NULL) {
@@ -422,33 +436,47 @@ static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int de
 
 
 /* Reads indirect blocks */
-static int ext2_block_ind(ext2_t *fs, ext2_obj_t *obj, int depth, uint32_t offs[4], uint32_t *ind[3])
+static int ext2_block_ind(ext2_t *fs, ext2_obj_t *obj, int depth, uint32_t offs[4], uint32_t *ind[3], bool alloc)
 {
 	int err;
 
+	ind[0] = NULL;
+	ind[1] = NULL;
+	ind[2] = NULL;
+
 	if (depth == 4) {
-		if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[3], depth, ind + 2)) < 0)
+		if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[3], depth, ind + 2, alloc)) < 0)
 			return err;
 	}
 
 	if (depth >= 3) {
 		if (depth == 4) {
-			if ((err = ext2_block_readind(fs, obj, ind[2] + offs[2], --depth, ind + 1)) < 0)
+			/* With alloc == false a missing parent means the whole subtree is
+			 * already gone; there is nothing below it to reach. */
+			if (ind[2] == NULL) {
+				return EOK;
+			}
+
+			if ((err = ext2_block_readind(fs, obj, ind[2] + offs[2], --depth, ind + 1, alloc)) < 0)
 				return err;
 		}
 		else {
-			if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[2], depth, ind + 1)) < 0)
+			if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[2], depth, ind + 1, alloc)) < 0)
 				return err;
 		}
 	}
 
 	if (depth >= 2) {
 		if (depth == 3) {
-			if ((err = ext2_block_readind(fs, obj, ind[1] + offs[1], --depth, ind)) < 0)
+			if (ind[1] == NULL) {
+				return EOK;
+			}
+
+			if ((err = ext2_block_readind(fs, obj, ind[1] + offs[1], --depth, ind, alloc)) < 0)
 				return err;
 		}
 		else {
-			if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[1], depth, ind)) < 0)
+			if ((err = ext2_block_readind(fs, obj, obj->inode->block + offs[1], depth, ind, alloc)) < 0)
 				return err;
 		}
 	}
@@ -467,7 +495,7 @@ int ext2_block_get(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t **res)
 		return depth;
 
 	if (depth > 1) {
-		if ((err = ext2_block_ind(fs, obj, depth, offs, ind)) < 0)
+		if ((err = ext2_block_ind(fs, obj, depth, offs, ind, true)) < 0)
 			return err;
 
 		*res = ind[0] + offs[0];
@@ -592,6 +620,7 @@ static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 		return err;
 	}
 
+
 	ext2_togglebit(bmp, offset);
 
 	if ((err = ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
@@ -639,7 +668,7 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 		if ((depth = ext2_block_offs(fs, block + i, offs)) < 0)
 			return depth;
 
-		if ((err = ext2_block_ind(fs, obj, depth, offs, ind)) < 0)
+		if ((err = ext2_block_ind(fs, obj, depth, offs, ind, false)) < 0)
 			return err;
 
 		if (ind[0] != NULL)
@@ -660,7 +689,7 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 			break;
 
 		case 3:
-			if (!offs[0]) {
+			if (!offs[0] && (ind[1] != NULL)) {
 				if ((err = ext2_block_destroyone(fs, *(ind[1] + offs[1]))) < 0)
 					return err;
 
@@ -676,14 +705,14 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 			break;
 
 		case 4:
-			if (!offs[0]) {
+			if (!offs[0] && (ind[1] != NULL)) {
 				if ((err = ext2_block_destroyone(fs, *(ind[1] + offs[1]))) < 0)
 					return err;
 
 				*(ind[1] + offs[1]) = 0;
 			}
 
-			if (!offs[1]) {
+			if (!offs[1] && (ind[2] != NULL)) {
 				if ((err = ext2_block_destroyone(fs, *(ind[2] + offs[2]))) < 0)
 					return err;
 
