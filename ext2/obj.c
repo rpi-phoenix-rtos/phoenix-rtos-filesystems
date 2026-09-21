@@ -65,6 +65,14 @@ static int _ext2_obj_destroy(ext2_t *fs, ext2_obj_t *obj, bool ignoreSync)
 		return err;
 	}
 
+	/* Record when the inode was freed. ext2 uses i_dtime to tell a deleted
+	 * inode from a live one whose bitmap bit was lost, and fsck reports a
+	 * freed inode with dtime == 0 as an error. Write it out before the inode
+	 * is released, since after that the table entry is no longer ours. */
+	obj->inode->dtime = time(NULL);
+	obj->inode->links = 0;
+	(void)ext2_inode_sync(fs, (uint32_t)obj->id, obj->inode);
+
 	err = ext2_inode_destroy(fs, (uint32_t)obj->id, obj->inode->mode);
 	if ((err < 0) && (!ignoreSync)) {
 		return err;

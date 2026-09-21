@@ -688,6 +688,13 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 			}
 			break;
 
+		/* A parent may only be released once its LAST child has been, so each
+		 * level's test includes every level below it. Walking backwards,
+		 * offs[k] == 0 means "this is the final entry of level k we will
+		 * visit". Testing offs[1] alone freed the double indirect on the very
+		 * first iteration -- offs[1] is already 0 when a file uses just one of
+		 * its entries -- which zeroed the pointer and left the single indirect
+		 * beneath it unreachable, and so never freed. */
 		case 3:
 			if (!offs[0] && (ind[1] != NULL)) {
 				if ((err = ext2_block_destroyone(fs, *(ind[1] + offs[1]))) < 0)
@@ -696,7 +703,7 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 				*(ind[1] + offs[1]) = 0;
 			}
 
-			if (!offs[1]) {
+			if (!offs[0] && !offs[1]) {
 				if ((err = ext2_block_destroyone(fs, obj->inode->block[offs[2]])) < 0)
 					return err;
 
@@ -712,14 +719,14 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 				*(ind[1] + offs[1]) = 0;
 			}
 
-			if (!offs[1] && (ind[2] != NULL)) {
+			if (!offs[0] && !offs[1] && (ind[2] != NULL)) {
 				if ((err = ext2_block_destroyone(fs, *(ind[2] + offs[2]))) < 0)
 					return err;
 
 				*(ind[2] + offs[2]) = 0;
 			}
 
-			if (!offs[2]) {
+			if (!offs[0] && !offs[1] && !offs[2]) {
 				if ((err = ext2_block_destroyone(fs, obj->inode->block[offs[3]])) < 0)
 					return err;
 
