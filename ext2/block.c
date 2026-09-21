@@ -626,7 +626,16 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 	uint32_t i, offs[4] = { 0 };
 	int err, depth;
 
-	for (i = 0; i < n; i++) {
+	/* Walk the range BACKWARDS. Each case below releases an indirect block when
+	 * its entry index reaches 0, meaning the block has just become empty, and
+	 * zeroes the pointer to it. Going forwards, index 0 is the FIRST entry
+	 * visited, so the pointer was cleared while the remaining 1023 entries were
+	 * still to come -- and ext2_block_readind() allocates a new indirect block
+	 * whenever it finds that pointer zero. Truncating therefore freed one
+	 * indirect block and immediately allocated a replacement that nothing ever
+	 * freed. Backwards, index 0 is the LAST entry visited, so nothing needs the
+	 * pointer afterwards. */
+	for (i = n; i-- > 0;) {
 		if ((depth = ext2_block_offs(fs, block + i, offs)) < 0)
 			return depth;
 
