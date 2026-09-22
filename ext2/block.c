@@ -541,7 +541,15 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 
 		if (!(*bno)) {
 			if (i < j) {
-				if ((err = ext2_block_get(fs, obj, i, &bno)) < 0)
+				/* `block + i`, not `i`: i indexes this call's buffer, so the
+				 * base has to be added to reach the file block. Without it a
+				 * run terminated by a HOLE was flushed to the physical block
+				 * of file block i -- the data was lost at the offset it was
+				 * written to, and overwrote whoever owned that block. The
+				 * other three flush sites in this function always had it;
+				 * this one did not, and it only fires for sparse files, which
+				 * is why sequential workloads never saw it. */
+				if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
 					return err;
 
 				if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, j - i)) < 0)
