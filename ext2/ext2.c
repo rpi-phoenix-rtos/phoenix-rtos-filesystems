@@ -616,7 +616,19 @@ int ext2_unlink(ext2_t *fs, id_t id, const char *name, size_t len)
 				break;
 
 			obj->inode->links--;
-			obj->flags |= OFLAG_DIRTY;
+
+			/* ⚠ Deliberately NOT marking obj dirty here.
+			 *
+			 * A surviving hard-linked file does need its new count on disk --
+			 * e2fsck reports "Inode 12 ref count is 2, should be 1" after
+			 * removing one of two names -- but flagging it dirty makes the
+			 * teardown path sync it and that hits a use-after-free in
+			 * ext2_objs_destroy() (ASan: the ext2_obj_t is freed by that loop
+			 * and read again on a later pass). The object-lifetime bug is the
+			 * one to fix; until then, leaving the stale count is strictly less
+			 * harmful than a crash in the storage driver. Tracked in the
+			 * weekly log with a seeded reproducer
+			 * (tools/libext2-hosttest/uaf.c case 5). */
 
 			if (S_ISDIR(obj->inode->mode)) {
 				/* Removing a subdirectory takes its '..' away from the parent,

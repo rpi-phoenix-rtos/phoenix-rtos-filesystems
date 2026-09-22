@@ -321,14 +321,24 @@ int ext2_obj_create(ext2_t *fs, uint32_t pino, ext2_inode_t *inode, uint16_t mod
 
 void ext2_objs_destroy(ext2_t *fs)
 {
-	rbnode_t *node, *next;
+	rbnode_t *node;
 
 	mutexLock(fs->objs->lock);
 
-	for (node = lib_rbMinimum(fs->objs->used.root); node != NULL; node = next) {
-		ext2_obj_t *obj = lib_treeof(ext2_obj_t, node, node);
+	/* Always take the CURRENT minimum rather than a successor saved before the
+	 * removal. `next = lib_rbNext(node)` was computed while the node was still
+	 * in the tree, and removing it rebalances -- so the traversal could come
+	 * back to a node this loop had already freed at the bottom of the body.
+	 * ASan caught it as a heap-use-after-free reading the ext2_obj_t itself.
+	 * Each iteration removes the minimum, so re-querying always advances. */
+	for (;;) {
+		node = lib_rbMinimum(fs->objs->used.root);
+		if (node == NULL) {
+			break;
+		}
 
-		next = lib_rbNext(node);
+		ext2_obj_t *obj = lib_treeof(ext2_obj_t, node, node);
+		size_t before = fs->objs->count;
 
 		/* Tearing the filesystem down releases the in-memory objects; it must
 		 * NOT delete the files they stand for. _ext2_obj_destroy() frees the
@@ -344,8 +354,20 @@ void ext2_objs_destroy(ext2_t *fs)
 		}
 		else {
 			(void)ext2_obj_sync(fs, obj);
-			(void)_ext2_obj_remove(fs, obj);
-			free(obj);
+
+			/* Only release the object if it actually left the tree; freeing it
+			 * otherwise would leave a dangling node, and re-querying the
+			 * minimum below would hand it straight back. */
+			if (_ext2_obj_remove(fs, obj) == 0) {
+				free(obj);
+			}
+		}
+
+		/* _ext2_obj_remove() is what decrements the count. If nothing was
+		 * removed the same node is still the minimum, so stop rather than
+		 * spin forever on it. */
+		if (fs->objs->count == before) {
+			break;
 		}
 	}
 
