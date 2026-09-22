@@ -587,13 +587,26 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 			j++;
 		}
 		else {
+			/* This block is not contiguous with the run in progress, so it
+			 * BEGINS the next one -- remember its physical number before the
+			 * flush below overwrites *bno (which points into the indirect
+			 * block cache).
+			 *
+			 * Setting lbno = 0 here instead left the new run's first block
+			 * unrecorded: the next iteration saw !lbno, accepted whatever
+			 * followed and set lbno from that, so block i and block i+1 were
+			 * never compared. A run starting with two DISCONTIGUOUS blocks was
+			 * then written as if contiguous, putting the second block's data
+			 * on top of whatever lived after the first. */
+			uint32_t cur = *bno;
+
 			if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
 				return err;
 
 			if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, j - i)) < 0)
 				return err;
 
-			lbno = 0;
+			lbno = cur;
 			i = j++;
 		}
 	}
