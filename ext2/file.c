@@ -241,12 +241,10 @@ ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *bu
 
 int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 {
-	uint32_t *bno, block, lbno = 0, n = 0;
+	uint32_t *bno, block, first = 0, run = 0, freed = 0;
 	uint32_t start = (size + fs->blocksz - 1) / fs->blocksz;
 	uint32_t end = (obj->inode->size + fs->blocksz - 1) / fs->blocksz;
 	int err;
-
-	/* FIXME: truncation for files with unallocated blocks might fail */
 
 	/* A short symlink keeps its target INSIDE the block array, and a device
 	 * node keeps its rdev there, so those uint32_t are not block numbers.
@@ -261,34 +259,70 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 	}
 
 	if (obj->inode->size > size) {
+		/* Release contiguous runs of ALLOCATED blocks in one call each.
+		 *
+		 * A hole (*bno == 0) owns no storage, so it must break the run rather
+		 * than extend it. The previous form tracked the last block number and
+		 * tested `!lbno || (*bno == lbno + 1)`, which treated a hole as
+		 * contiguous -- a hole set lbno = 0, and the next iteration's !lbno
+		 * test then continued the run. The run was then released as
+		 * `lbno + 1 - n`, i.e. `1 - n`, which UNDERFLOWS uint32_t for n > 1.
+		 * That handed ext2_block_destroy() a huge block number, so
+		 * ext2_blockToGroup() produced a huge group and the function read past
+		 * the end of fs->gdt[]; and where it did not fault it freed blocks
+		 * that had never been allocated, destroying whatever file owned them. */
 		for (block = start; block < end; block++) {
 			if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
 				return err;
 
-			/* count consecutive blocks to destroy them with one call */
-			if (!lbno || (*bno == lbno + 1)) {
-				n++;
+			if (*bno == 0) {
+				if (run > 0) {
+					if ((err = ext2_block_destroy(fs, first, run)) < 0)
+						return err;
+
+					freed += run;
+					run = 0;
+				}
+				continue;
+			}
+
+			if (run == 0) {
+				first = *bno;
+				run = 1;
+			}
+			else if (*bno == (first + run)) {
+				run++;
 			}
 			else {
-				if ((err = ext2_block_destroy(fs, lbno + 1 - n, n)) < 0)
+				if ((err = ext2_block_destroy(fs, first, run)) < 0)
 					return err;
 
-				n = 1;
+				freed += run;
+				first = *bno;
+				run = 1;
 			}
-
-			lbno = *bno;
 		}
 
-		if ((n > 0) && (err = ext2_block_destroy(fs, lbno + 1 - n, n)) < 0)
-			return err;
+		if (run > 0) {
+			if ((err = ext2_block_destroy(fs, first, run)) < 0)
+				return err;
+
+			freed += run;
+		}
 
 		if ((err = ext2_iblock_destroy(fs, obj, start, end - start)) < 0)
 			return err;
+
+		/* Only what was actually released. The previous form subtracted the
+		 * whole logical range, `(end - start) * blocksz / sectorsz`, counting
+		 * holes that never held a block -- e2fsck: "i_blocks is 4294967282".
+		 * It also sat outside this branch, so GROWING a file via truncate
+		 * computed a negative (end - start) and underflowed too. Indirect
+		 * blocks are accounted separately, by ext2_iblock_free(). */
+		obj->inode->blocks -= freed * (fs->blocksz / fs->sectorsz);
 	}
 
 	obj->inode->size = size;
-	/* FIXME: blocks counting is broken, move it to iblock_destroy */
-	obj->inode->blocks -= (end - start) * fs->blocksz / fs->sectorsz;
 	obj->inode->mtime = obj->inode->ctime = time(NULL);
 	obj->flags |= OFLAG_DIRTY;
 
