@@ -446,6 +446,23 @@ int ext2_setattr(ext2_t *fs, id_t id, int type, long long attr, const void *data
 			break;
 
 		case atSize:
+			/* Apply the same rule ext2_truncate() does.
+			 *
+			 * This path calls _ext2_file_truncate() DIRECTLY and so never saw
+			 * that check, while the inner function only guards device nodes
+			 * and short symlinks -- whose block array holds an rdev or a
+			 * target rather than block numbers. A directory's block array
+			 * holds REAL block numbers, so setattr(atSize, 0) on one returned
+			 * success and freed the directory's contents: every entry gone,
+			 * '..' left pointing at the NULL inode, and the children
+			 * unattached. It cannot be fixed inside _ext2_file_truncate()
+			 * because _ext2_obj_destroy() legitimately uses that to release a
+			 * removed directory's blocks. */
+			if (!S_ISREG(obj->inode->mode)) {
+				err = S_ISDIR(obj->inode->mode) ? -EISDIR : -EINVAL;
+				break;
+			}
+
 			if ((err = _ext2_file_truncate(fs, obj, attr)) < 0)
 				break;
 
