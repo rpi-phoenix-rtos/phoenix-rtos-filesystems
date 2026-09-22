@@ -320,6 +320,43 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 		 * computed a negative (end - start) and underflowed too. Indirect
 		 * blocks are accounted separately, by ext2_iblock_free(). */
 		obj->inode->blocks -= freed * (fs->blocksz / fs->sectorsz);
+
+		/* Zero what survives inside the last partial block.
+		 *
+		 * Whole blocks are released from `start` on, so when `size` falls
+		 * inside a block the bytes between `size` and the end of that block
+		 * stay on disk. Nothing reads them while the file is short, because
+		 * _ext2_file_read() clamps to inode->size -- but extending the file
+		 * again makes them readable, so previously-deleted content came back.
+		 * POSIX requires that gap to read as zeros. */
+		if ((size % fs->blocksz) != 0) {
+			uint32_t last = size / fs->blocksz;
+			uint32_t *lbno;
+
+			if ((err = ext2_block_get(fs, obj, last, &lbno)) < 0)
+				return err;
+
+			/* A hole already reads as zeros and owns nothing to clear. */
+			if (*lbno != 0) {
+				void *data = malloc(fs->blocksz);
+				if (data == NULL)
+					return -ENOMEM;
+
+				if ((err = ext2_block_init(fs, obj, last, data)) < 0) {
+					free(data);
+					return err;
+				}
+
+				memset((char *)data + (size % fs->blocksz), 0,
+						fs->blocksz - (size % fs->blocksz));
+
+				err = ext2_block_syncone(fs, obj, last, data);
+				free(data);
+
+				if (err < 0)
+					return err;
+			}
+		}
 	}
 
 	obj->inode->size = size;
