@@ -692,8 +692,17 @@ int ext2_statfs(ext2_t *fs, void *buf, size_t len)
 	st->f_bavail = (sb->freeBlocks > sb->resBlocks) ? sb->freeBlocks - sb->resBlocks : 0;
 	st->f_files = sb->inodes;
 	st->f_favail = st->f_ffree = sb->freeInodes;
-	st->f_fsid = (unsigned long)fs; /* TODO: filesystem ID should be generated at mount time */
-	st->f_flag = 0;                 /* TODO: mount options should be saved at mount time */
+	/* Derive the id from the superblock UUID, which is stable across mounts and
+	 * unique per filesystem. It used to be `(unsigned long)fs` -- the address of
+	 * our own heap allocation, which leaked a pointer to every caller of statvfs()
+	 * and changed on each mount of the same filesystem, so it was not an id at
+	 * all. Folding 16 bytes into a long necessarily loses information; f_fsid has
+	 * no uniqueness guarantee, and this is what Linux does with it too. */
+	st->f_fsid = 0;
+	for (int i = 0; i < 16; i++) {
+		st->f_fsid = (st->f_fsid * 31u) + sb->uuid[i];
+	}
+	st->f_flag = 0; /* TODO: mount options should be saved at mount time */
 	st->f_namemax = MAX_NAMELEN;
 
 	return EOK;
