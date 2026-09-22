@@ -650,6 +650,31 @@ static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 }
 
 
+/* Frees an indirect block AND drops it from i_blocks.
+ *
+ * ext2_block_readind() increments i_blocks when it allocates an indirect
+ * block ("e2fsck expects the indirect blocks in the total"), but the release
+ * path below only freed them, so every truncate left the file's i_blocks high
+ * by exactly its indirect-block count -- e2fsck: "i_blocks is 18, should be
+ * 0". Data blocks are accounted separately in _ext2_file_truncate(). */
+static int ext2_iblock_free(ext2_t *fs, ext2_obj_t *obj, uint32_t bno)
+{
+	int err;
+
+	if (bno == 0) {
+		return EOK;
+	}
+
+	if ((err = ext2_block_destroyone(fs, bno)) < 0) {
+		return err;
+	}
+
+	obj->inode->blocks -= fs->blocksz / fs->sectorsz;
+
+	return EOK;
+}
+
+
 int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 {
 	uint32_t *ind[3] = { NULL, NULL, NULL };
@@ -682,7 +707,7 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 
 		case 2:
 			if (!offs[0]) {
-				if ((err = ext2_block_destroyone(fs, obj->inode->block[offs[1]])) < 0)
+				if ((err = ext2_iblock_free(fs, obj, obj->inode->block[offs[1]])) < 0)
 					return err;
 
 				obj->inode->block[offs[1]] = 0;
@@ -698,14 +723,14 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 		 * beneath it unreachable, and so never freed. */
 		case 3:
 			if (!offs[0] && (ind[1] != NULL)) {
-				if ((err = ext2_block_destroyone(fs, *(ind[1] + offs[1]))) < 0)
+				if ((err = ext2_iblock_free(fs, obj, *(ind[1] + offs[1]))) < 0)
 					return err;
 
 				*(ind[1] + offs[1]) = 0;
 			}
 
 			if (!offs[0] && !offs[1]) {
-				if ((err = ext2_block_destroyone(fs, obj->inode->block[offs[2]])) < 0)
+				if ((err = ext2_iblock_free(fs, obj, obj->inode->block[offs[2]])) < 0)
 					return err;
 
 				obj->inode->block[offs[2]] = 0;
@@ -714,21 +739,21 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 
 		case 4:
 			if (!offs[0] && (ind[1] != NULL)) {
-				if ((err = ext2_block_destroyone(fs, *(ind[1] + offs[1]))) < 0)
+				if ((err = ext2_iblock_free(fs, obj, *(ind[1] + offs[1]))) < 0)
 					return err;
 
 				*(ind[1] + offs[1]) = 0;
 			}
 
 			if (!offs[0] && !offs[1] && (ind[2] != NULL)) {
-				if ((err = ext2_block_destroyone(fs, *(ind[2] + offs[2]))) < 0)
+				if ((err = ext2_iblock_free(fs, obj, *(ind[2] + offs[2]))) < 0)
 					return err;
 
 				*(ind[2] + offs[2]) = 0;
 			}
 
 			if (!offs[0] && !offs[1] && !offs[2]) {
-				if ((err = ext2_block_destroyone(fs, obj->inode->block[offs[3]])) < 0)
+				if ((err = ext2_iblock_free(fs, obj, obj->inode->block[offs[3]])) < 0)
 					return err;
 
 				obj->inode->block[offs[3]] = 0;

@@ -27,14 +27,20 @@
 
 int ext2_inode_sync(ext2_t *fs, uint32_t ino, ext2_inode_t *inode)
 {
-	uint32_t group = (ino - 1) / fs->sb->groupInodes;
-	uint32_t inodes = fs->blocksz / fs->sb->inodesz;
-	uint32_t bno = fs->gdt[group].inodeTbl + ((ino - 1) % fs->sb->groupInodes) / inodes;
+	uint32_t group, inodes, bno;
 	char *buff;
 	int err;
 
+	/* Validate BEFORE deriving the group -- see ext2_inode_init(). Worse here
+	 * than there: this is the WRITE path, so a block number derived from an
+	 * over-read of fs->gdt[] would write an inode table entry over an
+	 * arbitrary block. */
 	if (((fs->root != NULL) && (ino < (uint32_t)fs->root->id)) || (ino > fs->sb->inodes))
 		return -EINVAL;
+
+	group = (ino - 1) / fs->sb->groupInodes;
+	inodes = fs->blocksz / fs->sb->inodesz;
+	bno = fs->gdt[group].inodeTbl + ((ino - 1) % fs->sb->groupInodes) / inodes;
 
 	if ((buff = (char *)malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
@@ -59,14 +65,21 @@ int ext2_inode_sync(ext2_t *fs, uint32_t ino, ext2_inode_t *inode)
 
 ext2_inode_t *ext2_inode_init(ext2_t *fs, uint32_t ino)
 {
-	uint32_t group = (ino - 1) / fs->sb->groupInodes;
-	uint32_t inodes = fs->blocksz / fs->sb->inodesz;
-	uint32_t bno = fs->gdt[group].inodeTbl + ((ino - 1) % fs->sb->groupInodes) / inodes;
+	uint32_t group, inodes, bno;
 	ext2_inode_t *inode;
 	char *buff;
 
+	/* Validate BEFORE deriving the group, which indexes fs->gdt[]. This test
+	 * used to sit below those initialisers, so an out-of-range ino read past
+	 * the end of the group descriptor table and produced a plausible-looking
+	 * inodeTbl from whatever followed it -- silently, since nothing faults on
+	 * a heap over-read. */
 	if (((fs->root != NULL) && (ino < (uint32_t)fs->root->id)) || (ino > fs->sb->inodes))
 		return NULL;
+
+	group = (ino - 1) / fs->sb->groupInodes;
+	inodes = fs->blocksz / fs->sb->inodesz;
+	bno = fs->gdt[group].inodeTbl + ((ino - 1) % fs->sb->groupInodes) / inodes;
 
 	if ((buff = (char *)malloc(fs->blocksz)) == NULL)
 		return NULL;
