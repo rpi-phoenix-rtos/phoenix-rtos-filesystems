@@ -58,6 +58,21 @@ static inline uint32_t ext2_blockToOffs(const ext2_t *fs, uint32_t bno)
 }
 
 
+/* Is bno a block this filesystem actually has?
+ *
+ * An out-of-range block number means the caller derived it from corrupt
+ * metadata or from arithmetic that underflowed. Nothing used to check, and
+ * ext2_blockToGroup() of such a number yields a huge group index that reads
+ * past the end of fs->gdt[] -- which is how a `1 - n` underflow in the
+ * truncate path took the whole storage driver down with a Data Abort instead
+ * of returning an error. Validating at the boundary keeps a bad number away
+ * from the descriptor table whatever produced it. */
+static inline int ext2_blockValid(const ext2_t *fs, uint32_t bno)
+{
+	return ((bno >= fs->sb->fstBlock) && (bno < fs->sb->blocks)) ? 1 : 0;
+}
+
+
 static inline uint32_t ext2_blockFromOffs(const ext2_t *fs, uint32_t group, uint32_t offs)
 {
 	return fs->sb->fstBlock + (group * fs->sb->groupBlocks) + offs - 1;
@@ -114,10 +129,16 @@ int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n)
 
 int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 {
-	uint32_t group = ext2_blockToGroup(fs, bno);
-	uint32_t i, j, pgroup = group, offset = 0;
+	uint32_t group, i, j, pgroup, offset = 0;
 	void *bmp;
 	int err;
+
+	if ((n == 0) || !ext2_blockValid(fs, bno) || ((fs->sb->blocks - bno) < n)) {
+		return -EINVAL;
+	}
+
+	group = ext2_blockToGroup(fs, bno);
+	pgroup = group;
 
 	if ((bmp = malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
@@ -626,13 +647,19 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 /* Destroys a block */
 static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 {
-	uint32_t group = ext2_blockToGroup(fs, bno);
-	uint32_t offset = ext2_blockToOffs(fs, bno);
+	uint32_t group, offset;
 	void *bmp;
 	int err;
 
 	if (!bno)
 		return EOK;
+
+	if (!ext2_blockValid(fs, bno)) {
+		return -EINVAL;
+	}
+
+	group = ext2_blockToGroup(fs, bno);
+	offset = ext2_blockToOffs(fs, bno);
 
 	if ((bmp = malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
