@@ -437,6 +437,18 @@ int libext2_sync(void *fdata)
 }
 
 
+int libext2_busy(void *fdata)
+{
+	ext2_t *fs = (ext2_t *)fdata;
+
+	if (fs == NULL) {
+		return 0;
+	}
+
+	return (int)ext2_objs_busy(fs);
+}
+
+
 int libext2_unmount(void *fdata)
 {
 	ext2_t *fs = (ext2_t *)fdata;

@@ -27,6 +27,7 @@
 #define LIBEXT2_NAME    "ext2"
 #define LIBEXT2_TYPE    0x83
 #define LIBEXT2_HANDLER libext2_handler
+#define LIBEXT2_BUSY    libext2_busy
 #define LIBEXT2_UNMOUNT libext2_unmount
 #define LIBEXT2_MOUNT   libext2_mount
 
@@ -36,6 +37,10 @@ extern int libext2_handler(void *fdata, msg_t *msg);
 
 
 /* Unmounts filesystem */
+/* Number of objects held open; 0 means the filesystem can be unmounted safely */
+extern int libext2_busy(void *fdata);
+
+
 extern int libext2_unmount(void *fdata);
 
 

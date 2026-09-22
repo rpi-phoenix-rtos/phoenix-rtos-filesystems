@@ -319,6 +319,43 @@ int ext2_obj_create(ext2_t *fs, uint32_t pino, ext2_inode_t *inode, uint16_t mod
 }
 
 
+/* How many objects are held OPEN, i.e. would lose data or fault if the
+ * filesystem went away underneath them.
+ *
+ * ext2_open() takes a reference it never releases and ext2_close() nets it back,
+ * so refs is an open-descriptor count. Objects that are merely cached sit on the
+ * LRU with refs == 0. Mountpoints are excluded: their reference belongs to the
+ * filesystem mounted over them, not to a user of this one.
+ *
+ * ⚠ fs->root is excluded explicitly, not via the mountpoint flag: the mount path
+ * takes a permanent reference on it (`fs->root = ext2_obj_get(...)`), so counting
+ * it would make every filesystem read as busy forever and umount never work.
+ *
+ * ⚠ A request in flight also holds a transient reference, so a non-zero answer
+ * does not always mean "a file is open" -- for unmount that is the safe way to
+ * be wrong, since both cases mean "not now".
+ */
+uint32_t ext2_objs_busy(ext2_t *fs)
+{
+	rbnode_t *node;
+	uint32_t busy = 0;
+
+	mutexLock(fs->objs->lock);
+
+	for (node = lib_rbMinimum(fs->objs->used.root); node != NULL; node = lib_rbNext(node)) {
+		ext2_obj_t *obj = lib_treeof(ext2_obj_t, node, node);
+
+		if ((obj->refs > 0) && (obj != fs->root) && !EXT2_IS_MOUNTPOINT(obj)) {
+			busy++;
+		}
+	}
+
+	mutexUnlock(fs->objs->lock);
+
+	return busy;
+}
+
+
 void ext2_objs_destroy(ext2_t *fs)
 {
 	rbnode_t *node;

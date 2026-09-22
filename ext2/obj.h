@@ -93,6 +93,10 @@ extern int ext2_obj_create(ext2_t *fs, uint32_t pino, ext2_inode_t *inode, uint1
 
 
 /* Destroys filesystem objects */
+/* Number of objects currently held open (0 = safe to unmount) */
+extern uint32_t ext2_objs_busy(ext2_t *fs);
+
+
 extern void ext2_objs_destroy(ext2_t *fs);
 
 
