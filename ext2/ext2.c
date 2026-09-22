@@ -616,9 +616,25 @@ int ext2_unlink(ext2_t *fs, id_t id, const char *name, size_t len)
 				break;
 
 			obj->inode->links--;
+			obj->flags |= OFLAG_DIRTY;
+
 			if (S_ISDIR(obj->inode->mode)) {
+				/* Removing a subdirectory takes its '..' away from the parent,
+				 * so the parent loses a link. ext2_link() does the mirror of
+				 * this and marks the parent dirty and syncs it; this path
+				 * adjusted the counts in memory only, so the ON-DISK counts
+				 * stayed one too high for the parent and for any directory
+				 * that had ever held a subdirectory -- e2fsck: "Inode 2 ref
+				 * count is 14, should be 13". Files were unaffected because a
+				 * file whose count reaches 0 is destroyed, so its stale count
+				 * never mattered. */
 				dir->inode->links--;
+				dir->flags |= OFLAG_DIRTY;
 				obj->inode->links--;
+
+				if ((err = _ext2_obj_sync(fs, dir)) < 0)
+					break;
+
 				break;
 			}
 
