@@ -340,6 +340,19 @@ void ext2_objs_destroy(ext2_t *fs)
 		ext2_obj_t *obj = lib_treeof(ext2_obj_t, node, node);
 		size_t before = fs->objs->count;
 
+		/* Stop advertising this object as the root before releasing it.
+		 *
+		 * ext2_inode_init() and ext2_inode_sync() validate their `ino` against
+		 * fs->root->id, and the root is the lowest in-use inode so it is the
+		 * FIRST object this loop reaches. Freeing it while fs->root still
+		 * pointed at it meant every later object's sync read freed memory --
+		 * ASan: heap-use-after-free in ext2_inode_sync(). Those checks are
+		 * already written to tolerate a NULL root, which is exactly this
+		 * case: mid-teardown there is no root any more. */
+		if (obj == fs->root) {
+			fs->root = NULL;
+		}
+
 		/* Tearing the filesystem down releases the in-memory objects; it must
 		 * NOT delete the files they stand for. _ext2_obj_destroy() frees the
 		 * ON-DISK inode, and `ignoreSync` only suppresses the error it returns,
