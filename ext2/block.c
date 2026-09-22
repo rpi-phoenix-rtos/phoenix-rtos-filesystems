@@ -679,6 +679,26 @@ static int ext2_iblock_free(ext2_t *fs, ext2_obj_t *obj, uint32_t bno)
 
 	obj->inode->blocks -= fs->blocksz / fs->sectorsz;
 
+	/* Drop the block from the indirect-block cache.
+	 *
+	 * ext2_block_readind() writes a cached indirect block back when it evicts
+	 * it, and _ext2_obj_sync() writes back whatever is still cached. Freeing a
+	 * block that one of those slots still names therefore let a stale copy be
+	 * written to a block that had since been REALLOCATED to another file.
+	 *
+	 * The buffer is released rather than just clearing .bno: a slot with
+	 * data != NULL and bno == 0 would make the eviction path write to block 0,
+	 * and ext2_block_write() does not guard against that -- it would land on
+	 * the superblock. With data == NULL the next use allocates afresh and
+	 * takes the no-write-back path. */
+	for (int d = 0; d < 3; d++) {
+		if ((obj->ind[d].data != NULL) && (obj->ind[d].bno == bno)) {
+			free(obj->ind[d].data);
+			obj->ind[d].data = NULL;
+			obj->ind[d].bno = 0;
+		}
+	}
+
 	return EOK;
 }
 
