@@ -24,11 +24,17 @@
 #include "block.h"
 #include "file.h"
 
+/* Upper bound on a single coalesced read handed to the storage layer. Matches
+ * the 64 KiB block-cache line, so a longer run cannot avoid another fetch. */
+#define EXT2_READ_RUN_MAX (64u * 1024u)
+
 
 ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, size_t len)
 {
 	uint32_t block = offs / fs->blocksz;
 	uint32_t blkEnd;
+	/* Longest run handed to the storage layer in one call, in blocks. */
+	const uint32_t runMax = (EXT2_READ_RUN_MAX / fs->blocksz) > 0u ? (EXT2_READ_RUN_MAX / fs->blocksz) : 1u;
 	size_t l = 0;
 	void *data;
 	int err;
@@ -91,7 +97,14 @@ ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, siz
 		 * block this pointer refers into. */
 		first = *bno;
 
-		for (n = 1; (block + n) < blkEnd; n++) {
+		/* Cap the run. Before coalescing, this path never asked the storage
+		 * layer for more than ONE block, so an unbounded run hands a driver a
+		 * transfer far larger than anything it has ever seen -- and at 1 KiB
+		 * blocks a contiguous 16 MB file is 16384 of them. That faulted the
+		 * bcm2711-emmc driver serving the SD root. EXT2_READ_RUN_MAX bytes is
+		 * the whole benefit anyway: it matches the block cache's line, so a
+		 * longer run cannot save another fetch. */
+		for (n = 1; ((block + n) < blkEnd) && ((n + 1u) <= runMax); n++) {
 			if ((err = ext2_block_get(fs, obj, block + n, &bno)) < 0)
 				return err;
 
