@@ -393,11 +393,47 @@ int libext2_handler(void *fdata, msg_t *msg)
 			msg->o.err = libext2_statfs(fdata, msg->o.data, msg->o.size);
 			break;
 
+		case mtSync:
+			msg->o.err = libext2_sync(fdata);
+			break;
+
 		default:
 			break;
 	}
 
 	return EOK;
+}
+
+
+int libext2_sync(void *fdata)
+{
+	ext2_t *fs = (ext2_t *)fdata;
+
+	/* ext2 writes its metadata through on every operation, so by the time we
+	 * get here the data is in the layer BELOW us -- libcache inside the
+	 * storage driver -- and that is what has to be flushed.
+	 *
+	 * There was no mtSync case at all, so the handler's `default: break;` left
+	 * msg->o.err at the 0 the caller memset it to: sync() and fsync() returned
+	 * SUCCESS while nothing reached the medium. That is worse than failing.
+	 * It matters most on the Pi 4, where the SD root IS "/" and can therefore
+	 * never be unmounted -- a power cut simply loses whatever libcache holds,
+	 * and there was no way for anything to ask for a flush.
+	 *
+	 * The driver side was always ready: bcm2711-emmc publishes
+	 * .sync = sdstorage_cachedFlush, which calls cache_flush(). Nothing called
+	 * it. */
+	if ((fs->strg == NULL) ||
+			(fs->strg->dev == NULL) ||
+			(fs->strg->dev->blk == NULL) ||
+			(fs->strg->dev->blk->ops == NULL) ||
+			(fs->strg->dev->blk->ops->sync == NULL)) {
+		/* Mounted through the legacy read/write callbacks, or a device with no
+		 * sync op: say so rather than claiming success. */
+		return -ENOSYS;
+	}
+
+	return fs->strg->dev->blk->ops->sync(fs->strg);
 }
 
 

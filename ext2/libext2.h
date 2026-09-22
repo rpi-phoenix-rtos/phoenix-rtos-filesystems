@@ -39,6 +39,12 @@ extern int libext2_handler(void *fdata, msg_t *msg);
 extern int libext2_unmount(void *fdata);
 
 
+/* Flush to the medium. ext2 writes its metadata through, so this asks the
+ * storage layer below to flush its cache. Returns -ENOSYS for a filesystem
+ * mounted through the legacy callbacks, which have no sync operation. */
+extern int libext2_sync(void *fdata);
+
+
 /* Mounts filesystem */
 extern int libext2_mount(oid_t *dev, unsigned int sectorsz, ssize_t (*read)(id_t, off_t, char *, size_t), ssize_t (*write)(id_t, off_t, const char *, size_t), void **fdata);
 
