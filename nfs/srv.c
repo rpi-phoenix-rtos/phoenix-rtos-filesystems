@@ -839,9 +839,35 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 		else {
 			LOG("re-bind /tmp: node alloc failed (/tmp stays on NFS)\n");
 		}
+
+		/* ...and keep /ramtmp pointing at the same tmpfs.
+		 *
+		 * /ramtmp is where the RAM-staging convention puts things: the
+		 * quakespasm and vkquake glue both probe "/ramtmp/quake" BEFORE
+		 * "/tmp/quake", and tools/ffmpeg-port stages clips to /ramtmp/e4. Before
+		 * takeover /ramtmp is the tmpfs mountpoint, but the new NFS root knows
+		 * nothing about it, so afterwards the path resolves through NFS -- and
+		 * "stage it into RAM so it is not served over the network" quietly stages
+		 * it ONTO the network. Measured: a write to /tmp costs 48 us and the same
+		 * write to /ramtmp costs 1519 us, ~32x, with nothing reporting anything.
+		 *
+		 * Re-binding it costs one node and makes both spellings mean what the
+		 * callers already assume. Non-fatal exactly like /tmp above. */
+		nfs_node_t *ramNode;
+
+		(void)nfs_mkdir2(common.fs.nfs, "/ramtmp", 01777);
+		ramNode = nfs_node_get(&common.fs.nodes, "/ramtmp");
+		if (ramNode != NULL) {
+			ramNode->type = otDir;
+			ramNode->mnt = tmpfsOid;
+			LOG("re-bound /ramtmp (takeover, tmpfs port=%u)\n", tmpfsOid.port);
+		}
+		else {
+			LOG("re-bind /ramtmp: node alloc failed (/ramtmp stays on NFS)\n");
+		}
 	}
 	else {
-		LOG("re-bind /tmp: tmpfs port not found (/tmp stays on NFS)\n");
+		LOG("re-bind /tmp: tmpfs port not found (/tmp and /ramtmp stay on NFS)\n");
 	}
 
 	/* Start serving BEFORE the takeover so the new "/" answers lookups the
