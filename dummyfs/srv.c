@@ -112,6 +112,48 @@ static int dummyfs_mount_sync(dummyfs_t *ctx, const char *mountpt)
 	return 0;
 }
 
+/* How long -m waits for its mount point to appear: 50 x 100 ms = 5 s. */
+#define MOUNTPT_WAIT_TRIES 50
+#define MOUNTPT_WAIT_US    100000
+
+
+/*
+ * The mount point of -m lives in another filesystem, which may not be up yet.
+ * On SD boot this server starts in parallel with the SD card server, which
+ * registers "/" only once the card is initialised; until then every lookup
+ * fails at once with -ENOENT (the kernel does not block on a missing root),
+ * so dummyfs_mount() would fail ("dummyfs mount failed") and /tmp would stay
+ * on the card. Wait, bounded, until the mount point resolves; if it never
+ * does, dummyfs_mount() fails exactly as before, only later. When the mount
+ * point is already there (netboot: the RAM root is up first) this returns at
+ * the first try, without sleeping.
+ */
+static void dummyfs_waitMountpt(const char *mountpt)
+{
+	char *abspath;
+	oid_t oid;
+	int i, found;
+
+	for (i = 0; i < MOUNTPT_WAIT_TRIES; i++) {
+		found = 0;
+		abspath = resolve_path(mountpt, NULL, 1, 0);
+		if (abspath != NULL) {
+			found = (lookup(abspath, &oid, NULL) >= 0) ? 1 : 0;
+			free(abspath);
+		}
+		if (found != 0) {
+			if (i != 0) {
+				LOG("%s appeared after %d ms\n", mountpt, i * (MOUNTPT_WAIT_US / 1000));
+			}
+			return;
+		}
+		usleep(MOUNTPT_WAIT_US);
+	}
+
+	LOG("%s did not appear in %d ms\n", mountpt, MOUNTPT_WAIT_TRIES * (MOUNTPT_WAIT_US / 1000));
+}
+
+
 static char __attribute__((aligned(8))) mtstack[4096];
 
 void dummyfs_mount_async(void *arg)
@@ -238,6 +280,10 @@ int main(int argc, char **argv)
 		else {
 			portCreate(&port);
 		}
+	}
+
+	if (mountpt != NULL) {
+		dummyfs_waitMountpt(mountpt);
 	}
 
 	root.port = port;
