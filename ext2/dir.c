@@ -182,6 +182,9 @@ int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, 
 }
 
 
+/* The directory's mtime and ctime (POSIX: updated when an entry is added or
+ * removed) are set by the _ext2_file_write() or _ext2_file_truncate() that
+ * stores the changed entry block, and the inode is synced before returning. */
 int _ext2_dir_add(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len, uint16_t mode, uint32_t ino)
 {
 	uint32_t offs, size = 0;
@@ -320,6 +323,14 @@ int _ext2_dir_remove(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len)
 				err = _ext2_file_truncate(fs, dir, dir->inode->size - fs->blocksz);
 			} while (0);
 		}
+
+		/* _ext2_file_truncate() updates the directory's size, blocks, mtime and
+		 * ctime in memory only, unlike _ext2_file_write() in the other branches,
+		 * which syncs the inode. Without this the on-disk directory kept its old
+		 * size and timestamps (and still referenced the freed block) until the
+		 * object was evicted or the filesystem unmounted. */
+		if (err == EOK)
+			err = _ext2_obj_sync(fs, dir);
 	}
 	/* Entry at the start of the block => move next entry to the start of the block */
 	else {

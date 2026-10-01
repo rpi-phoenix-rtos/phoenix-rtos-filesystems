@@ -557,10 +557,15 @@ int ext2_link(ext2_t *fs, id_t id, const char *name, size_t len, id_t lid)
 		if ((err = _ext2_dir_add(fs, dir, name, len, obj->inode->mode, (uint32_t)lid)) < 0)
 			break;
 
+		/* A new name changes the inode (its link count), not its contents:
+		 * POSIX marks st_ctime only. Setting mtime here meant every rename,
+		 * which libphoenix implements as link + unlink, moved the file's mtime
+		 * and so looked like a content change to make and rsync. The parent
+		 * directory's mtime and ctime are updated by _ext2_dir_add(). */
 		obj->inode->links++;
 		obj->inode->uid = 0;
 		obj->inode->gid = 0;
-		obj->inode->mtime = obj->inode->atime = time(NULL);
+		obj->inode->ctime = time(NULL);
 		obj->flags |= OFLAG_DIRTY;
 
 		if (S_ISDIR(obj->inode->mode)) {
@@ -662,7 +667,16 @@ int ext2_unlink(ext2_t *fs, id_t id, const char *name, size_t len)
 				break;
 			}
 
-			obj->inode->mtime = obj->inode->atime = time(NULL);
+			/* As in ext2_link(): a surviving name's inode changed, its contents
+			 * did not, so only st_ctime moves. Write it out with the new link
+			 * count now; ext2_obj_put() does not sync, so both used to reach the
+			 * disk only when the object was evicted or the filesystem unmounted.
+			 * The parent directory's mtime and ctime are updated by
+			 * _ext2_dir_remove(). */
+			if (obj->inode->links > 0) {
+				obj->inode->ctime = time(NULL);
+				err = _ext2_obj_sync(fs, obj);
+			}
 		} while (0);
 
 		mutexUnlock(obj->lock);
