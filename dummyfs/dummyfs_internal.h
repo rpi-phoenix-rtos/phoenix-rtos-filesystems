@@ -43,8 +43,12 @@
 typedef struct _dummyfs_dirent_t {
 	rbnode_t linkage;
 	uint32_t key;
-	struct _dummyfs_dirent_t *prev;
+	struct _dummyfs_dirent_t *prev; /* entries with the same key */
 	struct _dummyfs_dirent_t *next;
+
+	off_t pos;                       /* readdir position, unique in the directory and never reused */
+	struct _dummyfs_dirent_t *lprev; /* all entries, in position order */
+	struct _dummyfs_dirent_t *lnext;
 
 	char *name;
 	size_t len;
@@ -71,9 +75,11 @@ typedef struct {
 		struct {
 			rbtree_t tree;
 			size_t entries;
+			dummyfs_dirent_t *list; /* entries in position order */
+			off_t nextPos;          /* position of the next entry added */
 			struct {
 				off_t offs;
-				dummyfs_dirent_t *entry;
+				dummyfs_dirent_t *entry; /* first entry at or after offs, NULL if unknown */
 			} hint;    /* Hint for ls iteration */
 		} dir;         /* Used for directories */
 		void *data;    /* Used for small files */

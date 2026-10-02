@@ -823,7 +823,9 @@ int dummyfs_destroy(void *ctx, oid_t *oid)
 }
 
 
-int dummyfs_readdir(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsigned int size)
+/* A position is the entry's own pos: it does not move when other entries are
+ * removed, so deleting during a scan neither skips nor repeats an entry. */
+int dummyfs_readdirNext(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsigned int size, off_t *next)
 {
 	TRACE();
 	dummyfs_t *fs = (dummyfs_t *)ctx;
@@ -845,32 +847,13 @@ int dummyfs_readdir(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsi
 		return -EINVAL;
 	}
 
-	dummyfs_dirent_t *ei;
-	dummyfs_dirent_t *etree;
-	off_t diroffs = 0;
+	dummyfs_dirent_t *ei = d->dir.list;
 	if ((d->dir.hint.entry != NULL) && (offs >= d->dir.hint.offs)) {
-		diroffs = d->dir.hint.offs;
 		ei = d->dir.hint.entry;
-		etree = ei;
-		while (etree->prev != NULL) {
-			etree = etree->prev;
-		}
-	}
-	else {
-		ei = lib_treeof(dummyfs_dirent_t, linkage, lib_rbMinimum(d->dir.tree.root));
-		etree = ei;
 	}
 
-	while ((diroffs < offs) && (ei != NULL)) {
-		diroffs += ei->len;
-
-		if (ei->next != NULL) {
-			ei = ei->next;
-		}
-		else {
-			ei = lib_treeof(dummyfs_dirent_t, linkage, lib_rbNext(&etree->linkage));
-			etree = ei;
-		}
+	while ((ei != NULL) && (ei->pos < offs)) {
+		ei = (ei->lnext != d->dir.list) ? ei->lnext : NULL;
 	}
 
 	if (ei == NULL) {
@@ -885,19 +868,32 @@ int dummyfs_readdir(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsi
 		return -EINVAL;
 	}
 
-	d->dir.hint.offs = diroffs;
-	d->dir.hint.entry = ei;
+	/* A client that adds d_reclen instead of taking *next lands on the same
+	 * position, unless more than 64 Ki removed entries lie in between. */
+	off_t end = ei->pos + 1;
+	d->dir.hint.offs = end;
+	d->dir.hint.entry = (ei->lnext != d->dir.list) ? ei->lnext : NULL;
 
 	dent->d_ino = ei->oid.id;
-	dent->d_reclen = ei->len;
+	dent->d_reclen = (uint16_t)(((end - offs) > UINT16_MAX) ? UINT16_MAX : (end - offs));
 	dent->d_namlen = ei->len;
 	dent->d_type = ei->type;
 	strcpy(dent->d_name, ei->name);
+
+	if (next != NULL) {
+		*next = end;
+	}
 
 	dummyfs_object_put(fs, d);
 	mutexUnlock(fs->mutex);
 
 	return 0;
+}
+
+
+int dummyfs_readdir(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsigned int size)
+{
+	return dummyfs_readdirNext(ctx, dir, offs, dent, size, NULL);
 }
 
 

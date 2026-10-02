@@ -57,6 +57,10 @@ int dummyfs_unlink(void *ctx, oid_t *dir, const char *name);
 int dummyfs_readdir(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsigned int size);
 
 
+/* As dummyfs_readdir(), and stores the position to read from next in *next if not NULL */
+int dummyfs_readdirNext(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, unsigned int size, off_t *next);
+
+
 int dummyfs_createMapped(void *ctx, oid_t *dir, const char *name, void *addr, size_t size, oid_t *oid);
 
 

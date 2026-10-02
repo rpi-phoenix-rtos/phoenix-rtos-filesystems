@@ -148,6 +148,10 @@ int dummyfs_dir_add(dummyfs_t *ctx, dummyfs_object_t *dir, const char *name, uin
 	n->name = dname;
 	n->len = len;
 
+	/* A new entry goes after every existing one, so the list stays in position order */
+	n->pos = dir->dir.nextPos++;
+	LIST_ADD_EX(&dir->dir.list, n, lnext, lprev);
+
 	if (prev != NULL) {
 		prev->next = n;
 	}
@@ -193,6 +197,13 @@ int dummyfs_dir_add(dummyfs_t *ctx, dummyfs_object_t *dir, const char *name, uin
 static void dummyfs_dir_removeEntry(dummyfs_t *ctx, dummyfs_object_t *dir, dummyfs_dirent_t *e)
 {
 	TRACE();
+	/* The positions of the other entries do not change, so a scan that is
+	 * removing what it reads (rm -rf) goes on at the entry after this one */
+	if (dir->dir.hint.entry == e) {
+		dir->dir.hint.entry = (e->lnext != dir->dir.list) ? e->lnext : NULL;
+	}
+	LIST_REMOVE_EX(&dir->dir.list, e, lnext, lprev);
+
 	if (e->prev == NULL) {
 		lib_rbRemove(&dir->dir.tree, &e->linkage);
 		if (e->next != NULL) {
@@ -214,9 +225,6 @@ static void dummyfs_dir_removeEntry(dummyfs_t *ctx, dummyfs_object_t *dir, dummy
 
 	assert(dir->dir.entries > 0);
 	dir->dir.entries--;
-
-	/* Invalidate ls hint */
-	dir->dir.hint.entry = NULL;
 }
 
 
@@ -263,6 +271,8 @@ int dummyfs_dir_init(dummyfs_t *ctx, dummyfs_object_t *dir)
 	(void)ctx;
 	lib_rbInit(&dir->dir.tree, dummyfs_dir_compare, NULL);
 	dir->dir.entries = 0;
+	dir->dir.list = NULL;
+	dir->dir.nextPos = 0;
 	dir->dir.hint.entry = NULL;
 	dir->dir.hint.offs = 0;
 	return 0;
