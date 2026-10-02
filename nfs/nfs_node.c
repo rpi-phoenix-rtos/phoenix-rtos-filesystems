@@ -263,11 +263,8 @@ void nfs_node_invalidateHandles(nfs_nodeTree_t *t)
 		/* The reclaim means the server's state moved on without us; a cached
 		 * attribute from before it is not something we can vouch for. */
 		n->attrValid = 0;
-		/* Directory snapshots are closed by the caller BEFORE the context swap
-		 * (nfs_reclaim), so there should be none left here; null them anyway so
-		 * no stale pointer can survive a reclaim by any route. */
-		n->dirCache = NULL;
-		n->dirOffs = 0;
+		/* A directory snapshot is a private copy of a listing, not libnfs
+		 * state, so it is not touched here (nfs_reclaim drops it anyway). */
 	}
 
 	/* The idle LRU referenced the now-invalidated fhs; reset it wholesale. */

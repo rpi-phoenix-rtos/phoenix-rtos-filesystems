@@ -3,7 +3,7 @@
  *
  * mt* -> libnfs handlers. See nfs_ops.h for the contract. The mapping mirrors
  * dummyfs's handler semantics (return chars-consumed from lookup, one dirent
- * per readdir keyed by a cumulative cookie, otSymlink-aware read/unlink) while
+ * per readdir keyed by a position, otSymlink-aware read/unlink) while
  * swapping dummyfs's in-RAM object store for libnfs sync calls against the
  * remote export.
  *
@@ -27,6 +27,7 @@
 
 #include <nfsc/libnfs.h>
 
+#include "nfs_dir.h"
 #include "nfs_ops.h"
 
 
@@ -126,12 +127,12 @@ static void nfs_attrDrop(nfs_node_t *n)
 }
 
 
-/* Close a node's cached directory snapshot, if it holds one. Safe to call on a
- * node that never had one, and on the node currently registered as fs->scanNode.
+/* Free a node's directory snapshot, if it holds one. Safe to call on a node
+ * that never had one, and on the node currently registered as fs->scanNode.
  *
  * Clears scanNode BEFORE the "nothing cached" early return, so this is the one
  * authority on the pairing rather than relying on every caller to have kept
- * scanNode and dirCache consistent. */
+ * scanNode and dirSnap consistent. */
 static void nfs_dirDrop(nfs_fs_t *fs, nfs_node_t *n)
 {
 	if (n == NULL) {
@@ -142,13 +143,12 @@ static void nfs_dirDrop(nfs_fs_t *fs, nfs_node_t *n)
 		fs->scanNode = NULL;
 	}
 
-	if (n->dirCache == NULL) {
+	if (n->dirSnap == NULL) {
 		return;
 	}
 
-	nfs_closedir(fs->nfs, n->dirCache);
-	n->dirCache = NULL;
-	n->dirOffs = 0;
+	nfs_dir_free(n->dirSnap);
+	n->dirSnap = NULL;
 }
 
 
@@ -270,13 +270,8 @@ static int nfs_reclaim(nfs_fs_t *fs)
 		return -EIO;
 	}
 
-	/* Close any open directory snapshot through the context that owns it, while
-	 * we still have that context. nfs_closedir with the dircache disabled (see
-	 * srv.c) lands in nfs_free_nfsdir, which ignores its nfs argument entirely,
-	 * so this is safe here — and it is the only thing that frees the listing:
-	 * nfs_destroy_context only walks the dircache list, which we keep empty, so
-	 * dropping the pointer instead would strand the snapshot and every strdup'd
-	 * name in it (tens of KB for a large directory) on every reclaim. */
+	/* The server's state moved on without us: list again rather than trust a
+	 * snapshot from before the expiry. */
 #ifdef NFS_MSG_TICK
 	nfs_openPhase = 5; /* re-mount returned OK */
 #endif
@@ -1214,7 +1209,12 @@ int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name)
 	}
 
 	nfs_attrDrop(d); /* directory mtime/nlink moved */
-	nfs_dirDrop(fs, d); /* ... and its listing still has the removed name in it */
+	/* ... and its listing still has the removed name in it. Strike the name
+	 * rather than dropping the listing: a scan that removes what it reads would
+	 * otherwise list the whole directory again for every entry. */
+	if (rc == 0) {
+		nfs_dir_remove(d->dirSnap, name);
+	}
 
 	/* st_nlink moved for EVERY name of that inode, not just this one. Dropping
 	 * only the unlinked node (below) left a sibling hard link answering stat()
@@ -1280,6 +1280,7 @@ int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid)
 	int rc = nfs_link(fs->nfs, target->path, path);
 	free(path);
 	nfs_attrDrop(d);      /* directory mtime moved */
+	nfs_dirDrop(fs, d);   /* ... and its listing lacks the new name */
 	nfs_attrDrop(target); /* st_nlink moved */
 	/* ... and it moved for the inode's OTHER names too. Only possible when we
 	 * had the inode cached; with nothing cached there is nothing stale to drop
@@ -1292,7 +1293,73 @@ int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid)
 }
 
 
-int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, size_t size)
+static int nfs_typeFromDirent(const struct nfsdirent *ent)
+{
+	/* Map the READDIRPLUS mode to Phoenix otX; mode 0 (no attributes) is otUnknown */
+	if (S_ISDIR(ent->mode)) {
+		return otDir;
+	}
+	if (S_ISLNK(ent->mode)) {
+		return otSymlink;
+	}
+	if (S_ISCHR(ent->mode) || S_ISBLK(ent->mode) || S_ISFIFO(ent->mode)) {
+		return otDev;
+	}
+	if (S_ISREG(ent->mode)) {
+		return otFile;
+	}
+	return otUnknown;
+}
+
+
+/* List the directory into a fresh snapshot owned by d. */
+static int nfs_dirList(nfs_fs_t *fs, nfs_node_t *d)
+{
+	struct nfsdir *nfsdir = NULL;
+	struct nfsdirent *ent;
+	int err = 0;
+
+	/* One snapshot at a time across the whole fs, so a scan cannot pin an
+	 * unbounded amount of listing memory. */
+	nfs_dirDrop(fs, d);
+	nfs_dirDrop(fs, fs->scanNode);
+
+	int rc = nfs_opendir(fs->nfs, d->path, &nfsdir);
+	if ((rc != 0) || (nfsdir == NULL)) {
+		return (rc != 0) ? nfs_err(rc) : -EIO;
+	}
+
+	nfs_dirSnap_t *snap = nfs_dir_new();
+	if (snap == NULL) {
+		nfs_closedir(fs->nfs, nfsdir);
+		return -ENOMEM;
+	}
+
+	while ((err == 0) && ((ent = nfs_readdir(fs->nfs, nfsdir)) != NULL)) {
+		/* skip any server-provided "."/".." so the synthesized ones are not duplicated */
+		if ((strcmp(ent->name, ".") == 0) || (strcmp(ent->name, "..") == 0)) {
+			continue;
+		}
+		err = nfs_dir_add(snap, ent->name, ent->inode, nfs_typeFromDirent(ent));
+	}
+
+	/* The copy is ours: libnfs's listing is not needed past this point. */
+	nfs_closedir(fs->nfs, nfsdir);
+
+	if (err != 0) {
+		nfs_dir_free(snap);
+		return err;
+	}
+
+	nfs_dir_sort(snap);
+	d->dirSnap = snap;
+	fs->scanNode = d;
+
+	return 0;
+}
+
+
+int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, size_t size, off_t *next)
 {
 	nfs_node_t *d = nfs_node_find(&fs->nodes, dir->id);
 	if (d == NULL) {
@@ -1302,18 +1369,9 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		return -EINVAL;
 	}
 
-	/* Snapshot strategy: walk to the cumulative-name-length cookie (matching
-	 * dummyfs semantics where the cookie is the sum of name lengths and
-	 * d_reclen == name length) and emit that one entry. The snapshot is kept
-	 * open between calls (see dirCache in nfs_node.h) so a sequential scan pays
-	 * for ONE listing rather than one per entry. */
-	struct nfsdirent *ent;
-	int emitted = -ENOENT;
-
 	/* POSIX readdir must return "." and ".." — NFS READDIR (via libnfs) does not
-	 * include them, so synthesize them as the first two entries (matching dummyfs).
-	 * With the cumulative-name-length cookie ("."=1, ".."=2) they consume cookie
-	 * slots 0 and 1, so the libnfs entries below start at diroffs 3. */
+	 * include them, so synthesize them as positions 0 and 1 (matching dummyfs).
+	 * The listed entries follow from NFS_DIR_FIRST. */
 	if ((offs == 0) || (offs == 1)) {
 		const char *dot = (offs == 0) ? "." : "..";
 		size_t namelen = (offs == 0) ? 1 : 2;
@@ -1338,11 +1396,16 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 			ino = (ino_t)st.nfs_ino;
 		}
 		dent->d_ino = ino;
+		/* d_reclen keeps the old cumulative-name-length layout ("." 1, ".." 2,
+		 * first entry at NFS_DIR_FIRST) for a client that advances by it. */
 		dent->d_reclen = (uint16_t)namelen;
 		dent->d_namlen = (uint16_t)namelen;
 		dent->d_type = otDir;
 		memcpy(dent->d_name, dot, namelen);
 		dent->d_name[namelen] = '\0';
+		if (next != NULL) {
+			*next = offs + 1;
+		}
 		/* offs 0 is a fresh scan (or a rewind): forget any snapshot so the entries
 		 * this scan goes on to read are listed now, not inherited from last time. */
 		if (offs == 0) {
@@ -1351,86 +1414,41 @@ int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, s
 		return 0;
 	}
 
-	/* Reuse the snapshot only if it is positioned exactly at the requested cookie;
-	 * anything else (a seek, a second interleaved scan) re-lists. */
-	struct nfsdir *nfsdir = NULL;
-	off_t diroffs;
-
-	if ((d->dirCache != NULL) && (d->dirOffs == offs)) {
-		nfsdir = d->dirCache;
-		diroffs = offs;
+	if (d->dirSnap == NULL) {
+		int err = nfs_dirList(fs, d);
+		if (err != 0) {
+			return err;
+		}
 	}
-	else {
+
+	/* With next, positions come from the names and hold across removals and
+	 * re-listings. Without it the client adds d_reclen, so positions must be
+	 * contiguous: they hold while this snapshot lives. */
+	off_t end = 0;
+	const nfs_dirEntry_t *e = nfs_dir_read(d->dirSnap, offs, (next != NULL) ? 1 : 0, &end);
+
+	if (e == NULL) {
+		/* End of directory: the snapshot is no longer positioned anywhere useful. */
 		nfs_dirDrop(fs, d);
-		/* One snapshot at a time across the whole fs, so a scan cannot pin an
-		 * unbounded amount of listing memory. */
-		nfs_dirDrop(fs, fs->scanNode);
-
-		int rc = nfs_opendir(fs->nfs, d->path, &nfsdir);
-		/* The handle is now persisted on the node, so a success return with a
-		 * NULL dir would be dereferenced by a LATER call, not this one. */
-		if ((rc != 0) || (nfsdir == NULL)) {
-			return (rc != 0) ? nfs_err(rc) : -EIO;
-		}
-		d->dirCache = nfsdir;
-		fs->scanNode = d;
-		diroffs = 3;
+		return -ENOENT;
 	}
 
-	while ((ent = nfs_readdir(fs->nfs, nfsdir)) != NULL) {
-		size_t namelen = strlen(ent->name);
-
-		/* skip any server-provided "."/".." so the synthesized ones are not duplicated */
-		if ((ent->name[0] == '.') && ((namelen == 1) || ((namelen == 2) && (ent->name[1] == '.')))) {
-			continue;
-		}
-
-		if (diroffs >= offs) {
-			if ((sizeof(struct dirent) + namelen + 1) > size) {
-				emitted = -EINVAL;
-				break;
-			}
-			dent->d_ino = (ino_t)ent->inode;
-			dent->d_reclen = (uint16_t)namelen;
-			dent->d_namlen = (uint16_t)namelen;
-
-			/* Map libnfs NF3* dir-entry type to Phoenix otX. type==0 (no
-			 * READDIRPLUS attrs) falls through to otUnknown. */
-			if (S_ISDIR(ent->mode)) {
-				dent->d_type = otDir;
-			}
-			else if (S_ISLNK(ent->mode)) {
-				dent->d_type = otSymlink;
-			}
-			else if (S_ISCHR(ent->mode) || S_ISBLK(ent->mode) || S_ISFIFO(ent->mode)) {
-				dent->d_type = otDev;
-			}
-			else if (S_ISREG(ent->mode)) {
-				dent->d_type = otFile;
-			}
-			else {
-				dent->d_type = otUnknown;
-			}
-
-			memcpy(dent->d_name, ent->name, namelen);
-			dent->d_name[namelen] = '\0';
-			emitted = 0;
-			/* Leave the snapshot open, positioned at the next entry, so the next
-			 * call is a local step instead of another listing. */
-			d->dirOffs = offs + (off_t)namelen;
-			break;
-		}
-
-		diroffs += (off_t)namelen;
+	if ((dent == NULL) || ((sizeof(struct dirent) + e->namelen + 1) > size)) {
+		return -EINVAL;
 	}
 
-	if (emitted != 0) {
-		/* End of directory, or the caller's buffer was too small: either way the
-		 * snapshot is no longer positioned anywhere useful. */
-		nfs_dirDrop(fs, d);
+	dent->d_ino = (ino_t)e->ino;
+	dent->d_reclen = (uint16_t)(((end - offs) > UINT16_MAX) ? UINT16_MAX : (end - offs));
+	dent->d_namlen = (uint16_t)e->namelen;
+	dent->d_type = e->type;
+	memcpy(dent->d_name, e->name, e->namelen);
+	dent->d_name[e->namelen] = '\0';
+
+	if (next != NULL) {
+		*next = end;
 	}
 
-	return emitted;
+	return 0;
 }
 
 

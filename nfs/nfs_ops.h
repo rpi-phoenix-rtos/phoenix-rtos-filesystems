@@ -42,7 +42,7 @@ typedef struct {
 	const char *server;
 	const char *export;
 	int version;
-	/* The one node currently holding an open directory snapshot (see dirCache in
+	/* The one node currently holding a directory snapshot (see dirSnap in
 	 * nfs_node.h), or NULL. Keeping it to one bounds how much listing memory a
 	 * scan can pin, and a scan reads one directory at a time. */
 	nfs_node_t *scanNode;
@@ -62,7 +62,9 @@ extern int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res
 extern int nfs_ops_destroy(nfs_fs_t *fs, oid_t *oid);
 extern int nfs_ops_unlink(nfs_fs_t *fs, oid_t *dir, const char *name);
 extern int nfs_ops_link(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *oid);
-extern int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, size_t size);
+/* With next != NULL (the client sent MSG_READDIR_NEXT), positions survive the
+ * removal of other entries and *next receives the position to read from next. */
+extern int nfs_ops_readdir(nfs_fs_t *fs, oid_t *dir, off_t offs, struct dirent *dent, size_t size, off_t *next);
 extern int nfs_ops_statfs(nfs_fs_t *fs, void *buf, size_t len);
 
 /* Keep the NFSv4 lease alive (send a RENEW) and, if it has already lapsed,
