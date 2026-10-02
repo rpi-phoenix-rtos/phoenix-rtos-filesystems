@@ -16,6 +16,7 @@
 #ifndef _EXT2_H_
 #define _EXT2_H_
 
+#include <dirent.h>
 #include <limits.h>
 #include <stdint.h>
 
@@ -117,6 +118,10 @@ extern int ext2_close(ext2_t *fs, id_t id);
 
 /* Reads from a file */
 extern ssize_t ext2_read(ext2_t *fs, id_t id, off_t offs, char *buff, size_t len);
+
+
+/* Reads the first directory entry at or after position offs; *next receives the position to read from next */
+extern int ext2_readdir(ext2_t *fs, id_t id, off_t offs, struct dirent *dent, size_t len, off_t *next);
 
 
 /* Writes to a file */
