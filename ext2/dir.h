@@ -47,7 +47,7 @@ typedef struct {
 } ext2_dirent_t;
 
 
-/* Checks if directory is empty (requires object to be locked) */
+/* Checks if directory is empty: 1 if it is, 0 if not, or a negative error (requires object to be locked) */
 extern int _ext2_dir_empty(ext2_t *fs, ext2_obj_t *dir);
 
 
@@ -55,8 +55,8 @@ extern int _ext2_dir_empty(ext2_t *fs, ext2_obj_t *dir);
 extern int _ext2_dir_search(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len, id_t *res);
 
 
-/* Reads directory entry (requires object to be locked) */
-extern int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, size_t len);
+/* Reads the first entry at or after position offs, and the position after it into next if not NULL (requires object to be locked) */
+extern int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, size_t len, off_t *next);
 
 
 /* Adds directory entry (requires object to be locked) */

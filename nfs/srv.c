@@ -486,7 +486,8 @@ static void nfs_loopThread(void *arg)
 				break;
 
 			case mtReaddir:
-				msg.o.err = nfs_ops_readdir(fs, &msg.oid, msg.i.readdir.offs, msg.o.data, msg.o.size);
+				msg.o.err = nfs_ops_readdir(fs, &msg.oid, msg.i.readdir.offs, msg.o.data, msg.o.size,
+					((msg.i.readdir.flags & MSG_READDIR_NEXT) != 0U) ? &msg.o.readdir.next : NULL);
 				break;
 
 			case mtStat:

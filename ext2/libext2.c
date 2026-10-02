@@ -293,16 +293,22 @@ static int libext2_unlink(void *info, oid_t *oid, const char *name)
 }
 
 
-static int libext2_readdir(void *info, oid_t *oid, off_t offs, struct dirent *dent, size_t size)
+static int libext2_readdirNext(void *info, oid_t *oid, off_t offs, struct dirent *dent, size_t size, off_t *next)
 {
 	ext2_t *fs = (ext2_t *)info;
 	int ret;
 
 	mutexLock(fs->lock);
-	ret = ext2_read(fs, oid->id, offs, (char *)dent, size);
+	ret = ext2_readdir(fs, oid->id, offs, dent, size, next);
 	mutexUnlock(fs->lock);
 
 	return ret;
+}
+
+
+static int libext2_readdir(void *info, oid_t *oid, off_t offs, struct dirent *dent, size_t size)
+{
+	return libext2_readdirNext(info, oid, offs, dent, size, NULL);
 }
 
 
@@ -347,7 +353,8 @@ int libext2_handler(void *fdata, msg_t *msg)
 			break;
 
 		case mtReaddir:
-			msg->o.err = libext2_readdir(fdata, &msg->oid, msg->i.readdir.offs, msg->o.data, msg->o.size);
+			msg->o.err = libext2_readdirNext(fdata, &msg->oid, msg->i.readdir.offs, msg->o.data, msg->o.size,
+				((msg->i.readdir.flags & MSG_READDIR_NEXT) != 0U) ? &msg->o.readdir.next : NULL);
 			break;
 
 		case mtWrite:
@@ -524,7 +531,8 @@ const static storage_fsops_t fsOps = {
 	.unlink = libext2_unlink,
 	.readdir = libext2_readdir,
 	.statfs = libext2_statfs,
-	.sync = NULL
+	.sync = NULL,
+	.readdirNext = libext2_readdirNext,
 };
 
 

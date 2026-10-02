@@ -391,8 +391,8 @@ int main(int argc, char **argv)
 				break;
 
 			case mtReaddir:
-				msg.o.err = dummyfs_readdir(ctx, &msg.oid, msg.i.readdir.offs,
-					msg.o.data, msg.o.size);
+				msg.o.err = dummyfs_readdirNext(ctx, &msg.oid, msg.i.readdir.offs, msg.o.data, msg.o.size,
+					((msg.i.readdir.flags & MSG_READDIR_NEXT) != 0U) ? &msg.o.readdir.next : NULL);
 				break;
 
 			case mtStat:

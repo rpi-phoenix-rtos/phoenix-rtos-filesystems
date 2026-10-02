@@ -195,7 +195,7 @@ ssize_t ext2_read(ext2_t *fs, id_t id, off_t offs, char *buff, size_t len)
 			ret = -EINVAL;
 		}
 		else {
-			ret = _ext2_dir_read(fs, obj, offs, (struct dirent *)buff, len);
+			ret = _ext2_dir_read(fs, obj, offs, (struct dirent *)buff, len, NULL);
 		}
 	}
 	else if (EXT2_ISDEV(obj->inode->mode)) {
@@ -209,6 +209,33 @@ ssize_t ext2_read(ext2_t *fs, id_t id, off_t offs, char *buff, size_t len)
 	ext2_obj_put(fs, obj);
 
 	return ret;
+}
+
+
+int ext2_readdir(ext2_t *fs, id_t id, off_t offs, struct dirent *dent, size_t len, off_t *next)
+{
+	ext2_obj_t *obj;
+	int ret;
+
+	if ((obj = ext2_obj_get(fs, id)) == NULL)
+		return -EINVAL;
+
+	mutexLock(obj->lock);
+
+	if (!S_ISDIR(obj->inode->mode)) {
+		ret = -ENOTDIR;
+	}
+	else if (EXT2_IS_MOUNTPOINT(obj)) {
+		ret = -EINVAL;
+	}
+	else {
+		ret = _ext2_dir_read(fs, obj, offs, dent, len, next);
+	}
+
+	mutexUnlock(obj->lock);
+	ext2_obj_put(fs, obj);
+
+	return (ret < 0) ? ret : EOK;
 }
 
 
@@ -629,9 +656,14 @@ int ext2_unlink(ext2_t *fs, id_t id, const char *name, size_t len)
 		mutexLock(obj->lock);
 
 		do {
-			if (S_ISDIR(obj->inode->mode) && (EXT2_IS_MOUNTPOINT(obj) || !_ext2_dir_empty(fs, obj))) {
-				err = -ENOTEMPTY;
-				break;
+			/* _ext2_dir_empty() can also fail: an error is not "empty", or a
+			 * directory it could not read would be removed with its contents. */
+			if (S_ISDIR(obj->inode->mode)) {
+				err = EXT2_IS_MOUNTPOINT(obj) ? 0 : _ext2_dir_empty(fs, obj);
+				if (err <= 0) {
+					err = (err < 0) ? err : -ENOTEMPTY;
+					break;
+				}
 			}
 
 			if ((err = _ext2_dir_remove(fs, dir, name, len)) < 0)

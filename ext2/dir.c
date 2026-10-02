@@ -14,6 +14,7 @@
  */
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -25,46 +26,59 @@
 #include "file.h"
 
 
+/* Is this record well formed? A bad one would make a walk loop or overrun the block. */
+static int _ext2_dir_valid(ext2_t *fs, const ext2_dirent_t *entry, uint32_t offs)
+{
+	return (entry->size >= sizeof(ext2_dirent_t)) && (entry->size <= fs->blocksz - offs) &&
+		(sizeof(ext2_dirent_t) + entry->len <= entry->size);
+}
+
+
+static int _ext2_dir_isdot(const ext2_dirent_t *entry)
+{
+	return ((entry->len == 1) && (entry->name[0] == '.')) ||
+		((entry->len == 2) && (entry->name[0] == '.') && (entry->name[1] == '.'));
+}
+
+
+/* Every block is walked: a directory that once spanned several blocks keeps
+ * its emptied middle blocks (see _ext2_dir_remove()), so its size says nothing
+ * about whether it is empty. */
 int _ext2_dir_empty(ext2_t *fs, ext2_obj_t *dir)
 {
 	ext2_dirent_t *entry;
-	uint32_t offs = 0;
+	uint32_t boffs, offs;
 	ssize_t ret;
 	char *buff;
-
-	if (!dir->inode->size)
-		return EOK;
-
-	if (dir->inode->size > fs->blocksz)
-		return -EBUSY;
+	int empty = 1;
 
 	if ((buff = (char *)malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
 
-	if ((ret = _ext2_file_read(fs, dir, offs, buff, fs->blocksz)) != fs->blocksz) {
-		free(buff);
-		return (ret < 0) ? (int)ret : -EINVAL;
+	for (boffs = 0; (boffs < dir->inode->size) && (empty == 1); boffs += fs->blocksz) {
+		if ((ret = _ext2_file_read(fs, dir, boffs, buff, fs->blocksz)) != fs->blocksz) {
+			empty = (ret < 0) ? (int)ret : -EINVAL;
+			break;
+		}
+
+		for (offs = 0; offs < fs->blocksz; offs += entry->size) {
+			entry = (ext2_dirent_t *)(buff + offs);
+
+			if (!_ext2_dir_valid(fs, entry, offs)) {
+				empty = -EIO;
+				break;
+			}
+
+			if ((entry->ino != 0) && !_ext2_dir_isdot(entry)) {
+				empty = 0;
+				break;
+			}
+		}
 	}
 
-	entry = (ext2_dirent_t *)buff;
-
-	if ((entry->len != 1) || strncmp(entry->name, ".", 1)) {
-		free(buff);
-		return -EINVAL;
-	}
-
-	offs += entry->size;
-	entry = (ext2_dirent_t *)(buff + offs);
-
-	if ((entry->len != 2) || strncmp(entry->name, "..", 2)) {
-		free(buff);
-		return -EINVAL;
-	}
-
-	offs += entry->size;
 	free(buff);
 
-	return (offs == fs->blocksz);
+	return empty;
 }
 
 
@@ -84,7 +98,8 @@ static int _ext2_dir_find(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t 
 			if (!entry->size)
 				break;
 
-			if (((size_t)entry->len == len) && !strncmp(entry->name, name, len))
+			/* inode 0: an unused record whose old name may still be there */
+			if ((entry->ino != 0) && ((size_t)entry->len == len) && !strncmp(entry->name, name, len))
 				return boffs;
 		}
 	}
@@ -115,39 +130,59 @@ int _ext2_dir_search(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len, 
 }
 
 
-int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, size_t len)
+/* A position is the byte offset of an entry, so it stays valid while other
+ * entries are removed: no removal moves a live entry (see _ext2_dir_remove()).
+ * A position can still fall inside a record, when the entry it pointed at was
+ * removed and merged into the previous one, so the block is walked from its
+ * start to the first live entry at or after the position. */
+int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, size_t len, off_t *next)
 {
-	ext2_dirent_t *entry;
+	ext2_dirent_t *entry = NULL;
+	uint32_t boffs, eoffs = 0;
 	ssize_t ret;
+	char *buff;
+	int err = -ENOENT;
 
-	if (!dir->inode->size || !dir->inode->links)
-		return -ENOENT;
-
-	if (len < sizeof(ext2_dirent_t))
+	if (offs < 0)
 		return -EINVAL;
 
-	if ((entry = (ext2_dirent_t *)malloc(len)) == NULL)
+	if (!dir->inode->size || !dir->inode->links || (offs >= dir->inode->size))
+		return -ENOENT;
+
+	if ((buff = (char *)malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
 
-	ret = _ext2_file_read(fs, dir, offs, (char *)entry, len);
+	for (boffs = (uint32_t)offs - (uint32_t)offs % fs->blocksz; boffs < dir->inode->size; boffs += fs->blocksz) {
+		if ((ret = _ext2_file_read(fs, dir, boffs, buff, fs->blocksz)) != fs->blocksz) {
+			err = (ret < 0) ? (int)ret : -EINVAL;
+			break;
+		}
 
-	if (ret < (ssize_t)sizeof(ext2_dirent_t)) {
-		free(entry);
-		return (ret < 0) ? (int)ret : -ENOENT;
+		for (eoffs = 0; eoffs < fs->blocksz; eoffs += entry->size) {
+			entry = (ext2_dirent_t *)(buff + eoffs);
+
+			if (!_ext2_dir_valid(fs, entry, eoffs)) {
+				err = -EIO;
+				break;
+			}
+
+			if ((boffs + eoffs >= offs) && (entry->ino != 0) && (entry->len != 0)) {
+				err = EOK;
+				break;
+			}
+		}
+
+		if (err != -ENOENT)
+			break;
 	}
 
-	if (ret < (ssize_t)(sizeof(ext2_dirent_t) + entry->len)) {
-		free(entry);
-		return -ENOENT;
+	if (err < 0) {
+		free(buff);
+		return err;
 	}
 
-	if (!entry->len) {
-		free(entry);
-		return -ENOENT;
-	}
-
-	if (len <= entry->len + sizeof(struct dirent)) {
-		free(entry);
+	if (len < sizeof(struct dirent) + entry->len + 1) {
+		free(buff);
 		return -EINVAL;
 	}
 
@@ -169,12 +204,20 @@ int _ext2_dir_read(ext2_t *fs, ext2_obj_t *dir, off_t offs, struct dirent *res, 
 			break;
 	}
 
+	/* The next position is the end of this record. A client that advances by
+	 * d_reclen instead of taking *next lands there too, unless the record is
+	 * further than 64 KiB past the position asked for (a long run of emptied
+	 * blocks), where d_reclen cannot reach and it reads this entry again. */
+	off_t end = (off_t)boffs + eoffs + entry->size;
 	res->d_ino = entry->ino;
-	res->d_reclen = entry->size;
+	res->d_reclen = (uint16_t)(((end - offs) > UINT16_MAX) ? UINT16_MAX : (end - offs));
 	res->d_namlen = entry->len;
 	memcpy(res->d_name, entry->name, entry->len);
 	res->d_name[entry->len] = '\0';
-	free(entry);
+	free(buff);
+
+	if (next != NULL)
+		*next = end;
 
 	dir->inode->atime = time(NULL);
 
@@ -276,7 +319,7 @@ int _ext2_dir_add(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len, uin
 int _ext2_dir_remove(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len)
 {
 	ext2_dirent_t *entry, *tmp;
-	uint32_t prev, boffs, offs = 0;
+	uint32_t prev, boffs, size, offs = 0;
 	ssize_t ret;
 	char *buff;
 	int err;
@@ -292,6 +335,10 @@ int _ext2_dir_remove(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len)
 	entry = (ext2_dirent_t *)(buff + offs);
 	boffs = err;
 
+	/* No live entry moves here: positions handed out by _ext2_dir_read() are
+	 * entry offsets, and a scan that removes what it reads (rm -rf) must find
+	 * the remaining entries where it left them. */
+
 	/* Entry in the middle of the block => expand previous entry size */
 	if (offs) {
 		for (prev = 0, tmp = (ext2_dirent_t *)buff; prev + tmp->size < offs;) {
@@ -305,24 +352,24 @@ int _ext2_dir_remove(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len)
 		else
 			err = EOK;
 	}
-	/* Entry takes entire block */
-	else if (entry->size == fs->blocksz) {
-		/* Last block => truncate */
-		if (boffs + fs->blocksz >= dir->inode->size) {
-			err = _ext2_file_truncate(fs, dir, dir->inode->size - fs->blocksz);
-		}
-		/* Middle block => copy last block and truncate */
-		else {
-			do {
-				if ((err = ext2_block_init(fs, dir, dir->inode->size / fs->blocksz - 1, buff)) < 0)
-					break;
+	/* Entry takes the entire last block => truncate it, with any emptied blocks before it */
+	else if ((entry->size == fs->blocksz) && (boffs + fs->blocksz >= dir->inode->size)) {
+		size = dir->inode->size - fs->blocksz;
 
-				if ((err = ext2_block_syncone(fs, dir, boffs / fs->blocksz, buff)) < 0)
-					break;
+		/* Block 0 holds "." and "..", so it is never empty. A block that cannot
+		 * be read is kept: it only costs space. */
+		while (size > fs->blocksz) {
+			if (_ext2_file_read(fs, dir, size - fs->blocksz, buff, fs->blocksz) != fs->blocksz)
+				break;
 
-				err = _ext2_file_truncate(fs, dir, dir->inode->size - fs->blocksz);
-			} while (0);
+			tmp = (ext2_dirent_t *)buff;
+			if ((tmp->ino != 0) || (tmp->size != fs->blocksz))
+				break;
+
+			size -= fs->blocksz;
 		}
+
+		err = _ext2_file_truncate(fs, dir, size);
 
 		/* _ext2_file_truncate() updates the directory's size, blocks, mtime and
 		 * ctime in memory only, unlike _ext2_file_write() in the other branches,
@@ -332,14 +379,9 @@ int _ext2_dir_remove(ext2_t *fs, ext2_obj_t *dir, const char *name, size_t len)
 		if (err == EOK)
 			err = _ext2_obj_sync(fs, dir);
 	}
-	/* Entry at the start of the block => move next entry to the start of the block */
+	/* Entry at the start of a block => keep its record as an unused one (inode 0) */
 	else {
-		tmp = (ext2_dirent_t *)((char *)buff + entry->size);
-		entry->ino = tmp->ino;
-		entry->size += tmp->size;
-		entry->type = tmp->type;
-		entry->len = tmp->len;
-		memcpy(entry->name, tmp->name, tmp->len);
+		entry->ino = 0;
 
 		if ((ret = _ext2_file_write(fs, dir, boffs, buff, fs->blocksz)) != fs->blocksz)
 			err = (ret < 0) ? (int)ret : -EINVAL;
