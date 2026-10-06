@@ -421,6 +421,10 @@ static void nfs_loopThread(void *arg)
 		}
 #endif
 
+		/* Before any handler can reach libnfs: a context abandoned by an earlier
+		 * timed-out call must not be used (see nfs_ops_recover). */
+		nfs_ops_recover(fs);
+
 		switch (msg.type) {
 			case mtOpen:
 				msg.o.err = nfs_ops_open(fs, &msg.oid);
