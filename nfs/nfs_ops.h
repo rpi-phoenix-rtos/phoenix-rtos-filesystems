@@ -53,7 +53,7 @@ extern int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res
 extern int nfs_ops_open(nfs_fs_t *fs, oid_t *oid);
 extern int nfs_ops_close(nfs_fs_t *fs, oid_t *oid);
 extern int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len);
-extern int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t len);
+extern int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t *offs, const void *buf, size_t len, unsigned int mode);
 extern int nfs_ops_truncate(nfs_fs_t *fs, oid_t *oid, size_t size);
 extern int nfs_ops_getattr(nfs_fs_t *fs, oid_t *oid, int type, long long *attr);
 extern int nfs_ops_getattrAll(nfs_fs_t *fs, oid_t *oid, struct _attrAll *attrs);

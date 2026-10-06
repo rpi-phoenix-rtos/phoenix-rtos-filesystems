@@ -439,7 +439,8 @@ static void nfs_loopThread(void *arg)
 				break;
 
 			case mtWrite:
-				msg.o.err = nfs_ops_write(fs, &msg.oid, msg.i.io.offs, msg.i.data, msg.i.size);
+				msg.o.io.offs = msg.i.io.offs;
+				msg.o.err = nfs_ops_write(fs, &msg.oid, &msg.o.io.offs, msg.i.data, msg.i.size, msg.i.io.mode);
 				break;
 
 			case mtTruncate:

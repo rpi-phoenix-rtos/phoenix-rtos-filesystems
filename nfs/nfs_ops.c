@@ -833,20 +833,33 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 }
 
 
-int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t len)
+int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t *offs, const void *buf, size_t len, unsigned int mode)
 {
 	nfs_node_t *n = nfs_node_find(&fs->nodes, oid->id);
 	if (n == NULL) {
 		return -EINVAL;
 	}
-	if (offs < 0) {
+	if (n->type == otDir) {
+		return -EISDIR;
+	}
+
+	/* O_APPEND: the kernel no longer moves the offset to the end of the file, on open or
+	 * on write -- every write lands at the size the server has NOW, and *offs reports
+	 * where it ended. Ask the server, not the attribute cache: another writer (the host
+	 * side of the export) may have grown the file since we last looked. */
+	if ((mode & O_APPEND) != 0U) {
+		struct nfs_stat_64 st;
+		int err = nfs_refreshStat(fs, n, &st, 1);
+		if (err < 0) {
+			return err;
+		}
+		*offs = (off_t)st.nfs_size;
+	}
+	if (*offs < 0) {
 		return -EINVAL;
 	}
 	if (len == 0) {
 		return 0;
-	}
-	if (n->type == otDir) {
-		return -EISDIR;
 	}
 
 	/* The reply carries an int; anything beyond is a (legal) short write. */
@@ -885,7 +898,7 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 		while (done < len) {
 			size_t want = nfs_ioLimit(len - done, nfs_get_writemax(fs->nfs));
 
-			rc = nfs_pwrite(fs->nfs, fh, (const char *)buf + done, want, (uint64_t)offs + done);
+			rc = nfs_pwrite(fs->nfs, fh, (const char *)buf + done, want, (uint64_t)*offs + done);
 			if (rc <= 0) {
 				break; /* an error, or no progress: never spin on a zero count */
 			}
@@ -913,6 +926,9 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 
 	/* Even a failed WRITE may have changed the file on the server. */
 	nfs_attrDrop(n);
+
+	/* The kernel takes the descriptor's new offset from the reply (o.io.offs). */
+	*offs += (off_t)done;
 
 	if (done > 0) {
 		return (int)done;
@@ -1144,7 +1160,22 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 	switch (type) {
 		case otFile: {
 			struct nfsfh *fh = NULL;
-			rc = nfs_creat(fs->nfs, path, (int)(mode & ALLPERMS), &fh);
+			/* A FIFO or device spliced in by mkfifo()/mknod() (the otDev case
+			 * below) exists only in our table, so the server would happily
+			 * create a regular file under its name: `> fifo` must open the
+			 * pipe, not shadow it. */
+			nfs_node_t *e = nfs_node_findPath(&fs->nodes, path);
+			if ((e != NULL) && (e->mnt.port != 0) && (e->type == otDev)) {
+				rc = -EEXIST;
+				break;
+			}
+			/* Exclusive: mtCreate of a name that exists must fail with -EEXIST.
+			 * The kernel's open(O_CREAT) creates FIRST and only looks the name up
+			 * on -EEXIST, so a create that succeeds on an existing file is taken
+			 * as "created" -- and nfs_creat() is O_CREAT|O_TRUNC, which would
+			 * empty the file on every open(O_CREAT) (`>>`, fopen "a", sqlite).
+			 * O_EXCL maps to GUARDED (v3) / EXCLUSIVE4 (v4). */
+			rc = nfs_open2(fs->nfs, path, O_CREAT | O_EXCL | O_WRONLY, (int)(mode & ALLPERMS), &fh);
 			if (rc == 0) {
 				if (fh != NULL) {
 					nfs_close(fs->nfs, fh);
@@ -1152,6 +1183,9 @@ int nfs_ops_create(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, unsig
 				/* HW-observed: nfs_creat over NFSv4 leaves mode 000 on the
 				 * server. Force the requested perms so executables get +x. */
 				(void)nfs_chmod(fs->nfs, path, (int)(mode & ALLPERMS));
+				/* EXCLUSIVE4 parks its verifier in atime/mtime until the client
+				 * sets them; without this every new file has a nonsense date. */
+				(void)nfs_utimes(fs->nfs, path, NULL);
 			}
 			break;
 		}
