@@ -17,7 +17,7 @@
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>   /* PATH_MAX (symlink readlink staging buffer) */
+#include <limits.h>   /* PATH_MAX (symlink readlink staging buffer), INT_MAX */
 #include <poll.h>
 #include <time.h>     /* clock_gettime (attribute-cache deadlines) */
 #include <unistd.h>   /* usleep (transient-error retry backoff) */
@@ -62,12 +62,46 @@ static int nfs_typeFromMode(uint64_t mode)
 }
 
 
-/* Is this a transient RPC error worth retrying (connection reset / timeout)? A genuine
- * missing entry (ENOENT) or other definite error is not. */
+/* Is this a transient RPC error worth retrying on the same context (a connection
+ * reset, which libnfs recovers from by reconnecting on the next call)? A genuine
+ * missing entry (ENOENT) or other definite error is not.
+ *
+ * Neither is -ETIMEDOUT: it means a sync call ran into its overall deadline
+ * (ports/libnfs/patches/04-sync-call-overall-deadline.patch), which abandons
+ * the context -- no socket, no reconnect pending. Retrying on it only waits out
+ * the deadline again, so a retry loop of 25 would hold the single loop thread
+ * for minutes. Callers hand it to nfs_tryReclaim() instead, and the loop
+ * rebuilds an abandoned context before the next request (nfs_ops_recover). */
 static int nfs_transient(int rc)
 {
-	int e = nfs_err(rc);
-	return (e == -EIO) || (e == -ETIMEDOUT);
+	return (nfs_err(rc) == -EIO) ? 1 : 0;
+}
+
+
+/* The most one READ or WRITE RPC may carry, if libnfs reports no limit. */
+#define NFS_IO_MAX_DEFAULT (1024u * 1024u)
+
+
+/* How many bytes of a len-byte transfer one RPC may carry.
+ *
+ * libnfs splits a large pread/pwrite into readmax/writemax-sized RPCs only on its
+ * NFSv3 path. Over NFSv4 (nfs4_pread/pwrite_async_internal) the whole count goes
+ * out as ONE compound. The server takes at most its own maximum per request
+ * (Linux nfsd: 1 MB), so a bigger WRITE is never answered -- the connection is
+ * dropped, libnfs reconnects and re-sends it forever, and the call ends at its
+ * overall deadline with nothing written (build 39: one 54 MB write() from prof).
+ * A READ is answered short by the server, but the request still sizes buffers
+ * and timeouts for the full count. So every transfer is cut to this size here.
+ * The result also fits the int our handlers return. */
+static size_t nfs_ioLimit(size_t len, size_t max)
+{
+	if (max == 0) {
+		max = NFS_IO_MAX_DEFAULT;
+	}
+	if (len > max) {
+		len = max;
+	}
+	return (len > (size_t)INT_MAX) ? (size_t)INT_MAX : len;
 }
 
 
@@ -318,6 +352,16 @@ static int nfs_tryReclaim(nfs_fs_t *fs, int rc, int *budget)
 }
 
 
+void nfs_ops_recover(nfs_fs_t *fs)
+{
+	if (nfs_get_fd(fs->nfs) >= 0) {
+		return;
+	}
+	printf("nfs-fs: previous call abandoned the client connection, rebuilding it\n");
+	(void)nfs_reclaim(fs);
+}
+
+
 int nfs_ops_renew(nfs_fs_t *fs)
 {
 #ifdef NFS_MSG_TICK
@@ -450,11 +494,7 @@ int nfs_ops_lookup(nfs_fs_t *fs, oid_t *dir, const char *name, oid_t *res, oid_t
 			rc = -EIO;
 			for (int tries = 0; tries < 25; tries++) {
 				rc = nfs_lstat64(fs->nfs, child, &st);
-				if (rc == 0) {
-					break;
-				}
-				int e = nfs_err(rc);
-				if (e != -EIO && e != -ETIMEDOUT) {
+				if ((rc == 0) || !nfs_transient(rc)) {
 					break;
 				}
 				usleep(tries < 6 ? (10000u << tries) : 640000u);
@@ -579,7 +619,10 @@ int nfs_ops_open(nfs_fs_t *fs, oid_t *oid)
 			nfs_openPhase = 2;
 			nfs_openRc = rc;
 #endif
-			if (rc != 0) {
+			/* A context the read-write attempt found dead (or whose state the
+			 * server has dropped) fails the read-only one the same way, after
+			 * the same wait: go straight to the reclaim below. */
+			if ((rc != 0) && (nfs_isRecoverable(fs, rc) == 0)) {
 				/* Fall back to read-only (e.g. mode lacks write), bounded-retrying transient RPC
 				 * errors — this open is on the exec path, so a transient failure here is a prime
 				 * cause of the intermittent exec -5. */
@@ -719,6 +762,11 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 		return -EISDIR;
 	}
 
+	/* One RPC's worth at most (see nfs_ioLimit). A read may return fewer bytes
+	 * than asked for anyway -- the server already caps it at its maximum -- and
+	 * readers loop. */
+	len = nfs_ioLimit(len, nfs_get_readmax(fs->nfs));
+
 	/* Regular file. Wrap "ensure an fh + read" in a reclaim loop: an NFSv4
 	 * lease/state expiry (idle >~90s, or server state loss) surfaces here — the
 	 * exec loader demand-pages a binary in through this path, so a cached open
@@ -734,11 +782,7 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 			int rc = -EIO;
 			for (int tries = 0; tries < 25; tries++) {
 				rc = nfs_open(fs->nfs, n->path, O_RDONLY, &fh);
-				if (rc == 0) {
-					break;
-				}
-				int e = nfs_err(rc);
-				if (e != -EIO && e != -ETIMEDOUT) {
+				if ((rc == 0) || !nfs_transient(rc)) {
 					break;
 				}
 				usleep(tries < 6 ? (10000u << tries) : 640000u);
@@ -760,11 +804,7 @@ int nfs_ops_read(nfs_fs_t *fs, oid_t *oid, off_t offs, void *buf, size_t len)
 		int rc = -EIO;
 		for (int tries = 0; tries < 25; tries++) {
 			rc = nfs_pread(fs->nfs, fh, buf, len, offs);
-			if (rc >= 0) {
-				break;
-			}
-			int e = nfs_err(rc);
-			if (e != -EIO && e != -ETIMEDOUT) {
+			if ((rc >= 0) || !nfs_transient(rc)) {
 				break;
 			}
 			usleep(tries < 6 ? (10000u << tries) : 640000u);   /* 10,20,40,80,160,320,640ms... */
@@ -809,34 +849,58 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 		return -EISDIR;
 	}
 
-	/* Reclaim loop (see nfs_ops_read): re-establish NFSv4 client state and retry
-	 * if the lease/state expired under us. */
+	/* The reply carries an int; anything beyond is a (legal) short write. */
+	if (len > (size_t)INT_MAX) {
+		len = (size_t)INT_MAX;
+	}
+
+	/* Written in RPC-sized chunks (see nfs_ioLimit), inside a reclaim loop (see
+	 * nfs_ops_read) that re-establishes the client after a state expiry or an
+	 * abandoned call and carries on.
+	 *
+	 * `done` counts bytes the server has acknowledged, and survives a reclaim:
+	 * the retry resumes there, so nothing acknowledged is sent twice, and the
+	 * chunk that failed is sent again whole at its own offset -- rewriting a
+	 * range with the same bytes is harmless if part of it had landed. A failure
+	 * after some progress is reported as a short write of what is known to be
+	 * on the server, as write(2) does. */
 	int reclaimBudget = NFS_RECLAIM_MAX;
+	size_t done = 0;
+	int rc = 0;
+
 	for (;;) {
 		struct nfsfh *fh = n->fh;
 		int owned = 0;
 		if (fh == NULL) {
-			int rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
+			rc = nfs_open(fs->nfs, n->path, O_RDWR, &fh);
 			if (rc != 0) {
 				if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
 					continue;
 				}
-				return nfs_err(rc);
+				break;
 			}
 			owned = 1;
 		}
 
-		int rc = nfs_pwrite(fs->nfs, fh, (void *)buf, len, offs);
+		while (done < len) {
+			size_t want = nfs_ioLimit(len - done, nfs_get_writemax(fs->nfs));
+
+			rc = nfs_pwrite(fs->nfs, fh, (const char *)buf + done, want, (uint64_t)offs + done);
+			if (rc <= 0) {
+				break; /* an error, or no progress: never spin on a zero count */
+			}
+			done += (size_t)rc;
+		}
 
 		if (rc >= 0) {
-			nfs_attrDrop(n); /* size/mtime moved */
 			if (owned != 0) {
 				nfs_close(fs->nfs, fh);
 			}
-			return rc;
+			break;
 		}
 
-		/* On expiry, do not nfs_close(fh) — reclaim frees the whole context. */
+		/* On a reclaim, do not nfs_close(fh): it belonged to the context the
+		 * reclaim destroyed. The next pass re-opens by path. */
 		if (nfs_tryReclaim(fs, rc, &reclaimBudget) != 0) {
 			continue;
 		}
@@ -844,8 +908,16 @@ int nfs_ops_write(nfs_fs_t *fs, oid_t *oid, off_t offs, const void *buf, size_t 
 		if (owned != 0) {
 			nfs_close(fs->nfs, fh);
 		}
-		return nfs_err(rc);
+		break;
 	}
+
+	/* Even a failed WRITE may have changed the file on the server. */
+	nfs_attrDrop(n);
+
+	if (done > 0) {
+		return (int)done;
+	}
+	return (rc < 0) ? nfs_err(rc) : -EIO;
 }
 
 

@@ -73,6 +73,15 @@ extern int nfs_ops_statfs(nfs_fs_t *fs, void *buf, size_t len);
  * caller treats a failure as non-fatal; the reclaim path is the safety net). */
 extern int nfs_ops_renew(nfs_fs_t *fs);
 
+/* Rebuild the libnfs context if an earlier call abandoned it. A sync call that
+ * runs into its overall deadline (ports/libnfs/patches/04-...) leaves the context
+ * with no socket and no reconnect pending. open/read/write reclaim on the spot,
+ * but every other handler just returns the error, and each later request would
+ * then wait out the whole deadline on the dead context before failing too, until
+ * the renew tick happened to reclaim. Called by the loop before each request;
+ * a no-op (one field read) on a live context. */
+extern void nfs_ops_recover(nfs_fs_t *fs);
+
 /* (Re-)create a libnfs context with this server's fixed transfer parameters.
  * Defined in srv.c (single source of truth for the tuning); declared here so
  * the reclaim path in nfs_ops.c can rebuild the context identically. */
