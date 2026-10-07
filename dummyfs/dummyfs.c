@@ -606,10 +606,12 @@ static int _dummyfs_link(dummyfs_t *fs, oid_t *dir, const char *name, oid_t *oid
 			o->nlink--;
 		}
 	}
-
-	d->mtime = time(NULL);
-	d->atime = d->mtime;
-	o->mtime = d->mtime;
+	else {
+		/* POSIX link(): the directory's data and status changed, the file's status only */
+		d->mtime = time(NULL);
+		d->ctime = d->mtime;
+		o->ctime = d->mtime;
+	}
 
 	dummyfs_object_put(fs, o);
 	dummyfs_object_put(fs, d);
@@ -673,11 +675,11 @@ static int _dummyfs_unlink(dummyfs_t *fs, oid_t *dir, const char *name)
 			o->nlink--;
 			d->nlink--;
 		}
+		/* POSIX unlink(): the directory's data and status changed, the file's status only */
+		d->mtime = time(NULL);
+		d->ctime = d->mtime;
+		o->ctime = d->mtime;
 	}
-
-	d->mtime = time(NULL);
-	d->atime = d->mtime;
-	o->mtime = d->mtime;
 
 	dummyfs_object_put(fs, d);
 	dummyfs_object_put(fs, o);
