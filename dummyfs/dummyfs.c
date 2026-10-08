@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <assert.h>
 #include <sys/minmax.h>
@@ -1091,7 +1092,7 @@ static int _dummyfs_writeObject(dummyfs_t *fs, dummyfs_object_t *o, off_t offs, 
 }
 
 
-int dummyfs_write(void *ctx, oid_t *oid, off_t offs, const char *buff, size_t len)
+int dummyfs_write(void *ctx, oid_t *oid, off_t *offs, const char *buff, size_t len, unsigned int mode)
 {
 	TRACE();
 	dummyfs_t *fs = (dummyfs_t *)ctx;
@@ -1102,9 +1103,16 @@ int dummyfs_write(void *ctx, oid_t *oid, off_t offs, const char *buff, size_t le
 		mutexUnlock(fs->mutex);
 		return -EINVAL;
 	}
-	int ret = _dummyfs_writeObject(fs, o, offs, buff, len);
+	if ((mode & O_APPEND) != 0) {
+		*offs = o->size;
+	}
+	int ret = _dummyfs_writeObject(fs, o, *offs, buff, len);
 	dummyfs_object_put(fs, o);
 	mutexUnlock(fs->mutex);
+
+	if (ret > 0) {
+		*offs += ret;
+	}
 
 	return (ret == -ENOMEM) ? -ENOSPC : ret;
 }

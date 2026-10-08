@@ -31,6 +31,7 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 	ext2_obj_t *obj;
 	oid_t devOther;
 	int ret;
+	off_t offs;
 	oid->port = fs->port;
 
 	switch (type) {
@@ -123,7 +124,8 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 		int retWrite;
 
 		/* not writing trailing '\0', readlink() does not append it */
-		retWrite = ext2_write(fs, oid->id, 0, target, targetlen);
+		offs = 0;
+		retWrite = ext2_write(fs, oid->id, &offs, target, targetlen, 0);
 		if (retWrite < 0) {
 			ret = retWrite;
 			ext2_destroy(fs, oid->id);
@@ -176,13 +178,13 @@ static ssize_t libext2_read(void *info, oid_t *oid, off_t offs, void *data, size
 }
 
 
-static ssize_t libext2_write(void *info, oid_t *oid, off_t offs, const void *data, size_t len)
+static ssize_t libext2_write(void *info, oid_t *oid, off_t *offs, const void *data, size_t len, unsigned int mode)
 {
 	ext2_t *fs = (ext2_t *)info;
 	ssize_t ret;
 
 	mutexLock(fs->lock);
-	ret = ext2_write(fs, oid->id, offs, data, len);
+	ret = ext2_write(fs, oid->id, offs, data, len, mode);
 	mutexUnlock(fs->lock);
 
 	return ret;
@@ -358,7 +360,8 @@ int libext2_handler(void *fdata, msg_t *msg)
 			break;
 
 		case mtWrite:
-			msg->o.err = libext2_write(fdata, &msg->oid, msg->i.io.offs, msg->i.data, msg->i.size);
+			msg->o.io.offs = msg->i.io.offs;
+			msg->o.err = libext2_write(fdata, &msg->oid, &msg->o.io.offs, msg->i.data, msg->i.size, msg->i.io.mode);
 			break;
 
 		case mtTruncate:

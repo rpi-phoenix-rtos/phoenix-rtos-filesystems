@@ -340,7 +340,8 @@ int main(int argc, char **argv)
 				break;
 
 			case mtWrite:
-				msg.o.err = dummyfs_write(ctx, &msg.oid, msg.i.io.offs, msg.i.data, msg.i.size);
+				msg.o.io.offs = msg.i.io.offs;
+				msg.o.err = dummyfs_write(ctx, &msg.oid, &msg.o.io.offs, msg.i.data, msg.i.size, msg.i.io.mode);
 				break;
 
 			case mtTruncate:
