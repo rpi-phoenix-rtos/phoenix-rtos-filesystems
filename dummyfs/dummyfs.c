@@ -850,6 +850,13 @@ int dummyfs_readdirNext(void *ctx, oid_t *dir, off_t offs, struct dirent *dent, 
 		return -EINVAL;
 	}
 
+	/* only rootdir is allowed to have 0 links */
+	if (d->nlink == 0 && d->oid.id != DUMMYFS_ROOTID) {
+		dummyfs_object_put(fs, d);
+		mutexUnlock(fs->mutex);
+		return -ENOENT;
+	}
+
 	dummyfs_dirent_t *ei = d->dir.list;
 	if ((d->dir.hint.entry != NULL) && (offs >= d->dir.hint.offs)) {
 		ei = d->dir.hint.entry;
