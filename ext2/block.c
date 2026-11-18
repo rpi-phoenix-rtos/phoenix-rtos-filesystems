@@ -217,6 +217,33 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 }
 
 
+/* Can group `group` have a free block at all?
+ *
+ * The allocators below search group by group from a starting group, and used
+ * to read every group's block bitmap to find out. The in-memory descriptor
+ * already says when a group has none, so a full group is skipped without
+ * touching the device.
+ *
+ * This is what made writing a large file slow. The search starts at the
+ * file's home group for every allocation (about five per MiB of a file at
+ * 1 KiB blocks: the data run plus one indirect block per 256 data blocks), so
+ * every full group between the home group and the free space was read again
+ * each time. Each bitmap lives in a different block group, i.e. a different
+ * block-cache line, so each read was a cache miss and a whole cache-line read
+ * from the card. On an SD root whose low groups are full (a new inode in group
+ * 3, free space from group 181) that was over 900 line reads per MiB written.
+ *
+ * Skipping cannot make a group with free blocks unreachable: the count is
+ * maintained together with the bitmap by every allocation and release below.
+ * If the descriptor is wrong and says 0 for a group that has free bits, the
+ * group is merely not used -- which is also what keeps that count from
+ * wrapping below zero. */
+static inline int ext2_groupHasFreeBlocks(const ext2_t *fs, uint32_t group)
+{
+	return (fs->gdt[group].freeBlocks != 0) ? 1 : 0;
+}
+
+
 /* Allocates one new block */
 /* Allocates one block, preferring the group that holds inode `ino` (its owner). */
 static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
@@ -230,12 +257,18 @@ static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
 		return -ENOMEM;
 
 	do {
-		if ((err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
-			free(bmp);
-			return err;
+		offset = 0;
+
+		if (ext2_groupHasFreeBlocks(fs, group)) {
+			if ((err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
+				free(bmp);
+				return err;
+			}
+
+			offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, 0);
 		}
 
-		if (!(offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, 0))) {
+		if (!offset) {
 			group = (group + 1) % fs->groups;
 
 			if (group == pgroup) {
@@ -297,17 +330,22 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 
 	uint32_t startGroup = group;
 	do {
-		err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1);
-		if (err < 0) {
-			free(bmp);
-			return err;
-		}
+		if (ext2_groupHasFreeBlocks(fs, group)) {
+			err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1);
+			if (err < 0) {
+				free(bmp);
+				return err;
+			}
 
-		if ((offset != 0) && (ext2_checkbit(bmp, offset) == 0)) {
-			break;
+			if ((offset != 0) && (ext2_checkbit(bmp, offset) == 0)) {
+				break;
+			}
+			else {
+				offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, offset);
+			}
 		}
 		else {
-			offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, offset);
+			offset = 0;
 		}
 
 		if (offset == 0) {
