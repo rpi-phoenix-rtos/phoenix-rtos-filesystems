@@ -69,6 +69,16 @@ typedef struct {
 	ext2_obj_t *root;  /* Root object */
 	ext2_objs_t *objs; /* Filesystem objects */
 
+	/* The block bitmap blocks are allocated from, with allocations not yet
+	 * written to the device (see ext2_block_flush()) */
+	struct {
+		void *bmp;      /* Bitmap of `group` including the allocations */
+		void *disk;     /* The same bitmap as the device has it (same allocation as bmp) */
+		uint32_t group; /* Group the bitmaps belong to */
+		int valid;      /* bmp and disk hold group's bitmap */
+		int dirty;      /* bmp has allocations disk does not */
+	} balloc;
+
 	/*
 	 * Filesystem-wide serialization lock.
 	 *

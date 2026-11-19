@@ -21,6 +21,7 @@
 #include <sys/stat.h>
 #include <sys/threads.h>
 
+#include "block.h"
 #include "ext2.h"
 #include "libext2.h"
 
@@ -420,18 +421,22 @@ int libext2_sync(void *fdata)
 	ext2_t *fs = (ext2_t *)fdata;
 	int err;
 
-	/* The superblock's free counts are the one piece of metadata written
-	 * lazily (see ext2_sb_sync()); write them now. */
+	/* Write what ext2 keeps back: block allocations nothing on the device
+	 * points to yet (see ext2_block_flush()), and the superblock's free counts
+	 * (see ext2_sb_sync()). */
 	mutexLock(fs->lock);
-	err = ext2_sb_sync(fs);
+	err = ext2_block_flush(fs);
+	if (err == EOK) {
+		err = ext2_sb_sync(fs);
+	}
 	mutexUnlock(fs->lock);
 
 	if (err < 0) {
 		return err;
 	}
 
-	/* Everything else ext2 writes through on every operation, so by the time
-	 * we get here the data is in the layer BELOW us -- libcache inside the
+	/* Everything else ext2 writes through as it goes, so by the time we get
+	 * here the data is in the layer BELOW us -- libcache inside the
 	 * storage driver -- and that is what has to be flushed.
 	 *
 	 * There was no mtSync case at all, so the handler's `default: break;` left

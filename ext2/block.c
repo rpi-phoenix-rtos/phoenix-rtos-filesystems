@@ -127,6 +127,156 @@ int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n)
 }
 
 
+/* Block allocation.
+ *
+ * Allocations are made in an in-memory copy of one group's block bitmap,
+ * fs->balloc, and written to the device -- the bitmap, then the group
+ * descriptor with its free count -- by ext2_block_flush(). One write() used to
+ * write both for every allocation it made: one for each run of data blocks and
+ * one for each indirect block, i.e. five bitmap and five descriptor writes per
+ * MiB written in 1 MiB writes at 1 KiB blocks, where one of each will do.
+ *
+ * The rule that keeps this crash-safe is that a block is marked in the bitmap
+ * on the device before any block pointer to it is: ext2_block_flush() runs
+ * before every inode is written and before every indirect block is written,
+ * except an indirect block that is itself among the allocations not yet
+ * flushed -- nothing on the device points to that one yet, since writing the
+ * pointer to it would have flushed first. So nothing on the device ever points
+ * to a block its bitmap does not mark, whenever the power is cut.
+ *
+ * Allocations can stay pending after an operation returns, but only ones that
+ * nothing on the device refers to: a write() writes its inode, which flushes
+ * them, while reading a hole (which allocates its indirect blocks) or a write
+ * that fails part way may not. Releasing blocks, allocating or releasing an
+ * inode, sync and unmount flush them too. */
+
+
+/* Writes the allocations made since the last flush to the device */
+int ext2_block_flush(ext2_t *fs)
+{
+	uint32_t group;
+	int err;
+
+	if (fs->balloc.dirty == 0) {
+		return EOK;
+	}
+
+	group = fs->balloc.group;
+
+	err = ext2_block_write(fs, fs->gdt[group].blockBmp, fs->balloc.bmp, 1);
+	if (err < 0) {
+		return err;
+	}
+
+	memcpy(fs->balloc.disk, fs->balloc.bmp, fs->blocksz);
+
+	/* On failure the allocations stay pending, and the next flush retries. */
+	err = ext2_gdt_syncone(fs, group);
+	if (err < 0) {
+		return err;
+	}
+
+	fs->balloc.dirty = 0;
+
+	return EOK;
+}
+
+
+/* Flushes the allocations and forgets the cached bitmap, for code that changes
+ * a block bitmap on the device directly (releasing blocks). */
+static int ext2_block_releaseBitmap(ext2_t *fs)
+{
+	int err = ext2_block_flush(fs);
+	if (err < 0) {
+		return err;
+	}
+
+	fs->balloc.valid = 0;
+
+	return EOK;
+}
+
+
+/* Makes `group` the group allocations are made in, reading its bitmap. The
+ * allocations pending in another group are flushed first. */
+static int ext2_block_loadBitmap(ext2_t *fs, uint32_t group)
+{
+	int err;
+
+	if ((fs->balloc.valid != 0) && (fs->balloc.group == group)) {
+		return EOK;
+	}
+
+	err = ext2_block_flush(fs);
+	if (err < 0) {
+		return err;
+	}
+
+	if (fs->balloc.bmp == NULL) {
+		char *buff = malloc(2u * fs->blocksz);
+		if (buff == NULL) {
+			return -ENOMEM;
+		}
+
+		fs->balloc.bmp = buff;
+		fs->balloc.disk = buff + fs->blocksz;
+	}
+
+	fs->balloc.valid = 0;
+
+	err = ext2_block_read(fs, fs->gdt[group].blockBmp, fs->balloc.disk, 1);
+	if (err < 0) {
+		return err;
+	}
+
+	memcpy(fs->balloc.bmp, fs->balloc.disk, fs->blocksz);
+	fs->balloc.group = group;
+	fs->balloc.valid = 1;
+
+	return EOK;
+}
+
+
+/* Is bno allocated but not yet marked in the bitmap on the device? */
+static int ext2_block_isPending(const ext2_t *fs, uint32_t bno)
+{
+	uint32_t offset;
+
+	if ((fs->balloc.dirty == 0) || !ext2_blockValid(fs, bno) || (ext2_blockToGroup(fs, bno) != fs->balloc.group)) {
+		return 0;
+	}
+
+	offset = ext2_blockToOffs(fs, bno);
+
+	return ((ext2_checkbit(fs->balloc.bmp, offset) != 0) && (ext2_checkbit(fs->balloc.disk, offset) == 0)) ? 1 : 0;
+}
+
+
+/* Takes n free blocks of the loaded group, from offset on */
+static void ext2_block_take(ext2_t *fs, uint32_t offset, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		ext2_togglebit(fs->balloc.bmp, offset + i);
+	}
+
+	fs->balloc.dirty = 1;
+	fs->gdt[fs->balloc.group].freeBlocks -= n;
+	fs->sb->freeBlocks -= n;
+}
+
+
+/* Gives back n blocks taken by ext2_block_take() and not used */
+static void ext2_block_untake(ext2_t *fs, uint32_t offset, uint32_t n)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		ext2_togglebit(fs->balloc.bmp, offset + i);
+	}
+
+	fs->gdt[fs->balloc.group].freeBlocks += n;
+	fs->sb->freeBlocks += n;
+}
+
+
 int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 {
 	uint32_t group, i, j, pgroup, offset = 0;
@@ -135,6 +285,10 @@ int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n)
 
 	if ((n == 0) || !ext2_blockValid(fs, bno) || ((fs->sb->blocks - bno) < n)) {
 		return -EINVAL;
+	}
+
+	if ((err = ext2_block_releaseBitmap(fs)) < 0) {
+		return err;
 	}
 
 	group = ext2_blockToGroup(fs, bno);
@@ -244,64 +398,33 @@ static inline int ext2_groupHasFreeBlocks(const ext2_t *fs, uint32_t group)
 }
 
 
-/* Allocates one new block */
 /* Allocates one block, preferring the group that holds inode `ino` (its owner). */
 static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
 {
 	uint32_t group = (ino - 1) / fs->sb->groupInodes;
 	uint32_t offset, pgroup = group;
-	void *bmp;
 	int err;
-
-	if ((bmp = malloc(fs->blocksz)) == NULL)
-		return -ENOMEM;
 
 	do {
 		offset = 0;
 
 		if (ext2_groupHasFreeBlocks(fs, group)) {
-			if ((err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
-				free(bmp);
+			if ((err = ext2_block_loadBitmap(fs, group)) < 0)
 				return err;
-			}
 
-			offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, 0);
+			offset = ext2_findzerobit(fs->balloc.bmp, fs->sb->groupBlocks, 0);
 		}
 
 		if (!offset) {
 			group = (group + 1) % fs->groups;
 
-			if (group == pgroup) {
-				free(bmp);
+			if (group == pgroup)
 				return -ENOSPC;
-			}
 		}
 	} while (!offset);
 
-	ext2_togglebit(bmp, offset);
-
-	if ((err = ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1)) < 0) {
-		free(bmp);
-		return err;
-	}
-
-	fs->gdt[group].freeBlocks--;
-
-	if ((err = ext2_gdt_syncone(fs, group)) < 0) {
-		ext2_togglebit(bmp, offset);
-
-		if (!ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1))
-			fs->gdt[group].freeBlocks++;
-		else
-			fs->sb->freeBlocks--;
-
-		free(bmp);
-		return err;
-	}
-
-	fs->sb->freeBlocks--;
+	ext2_block_take(fs, offset, 1);
 	*res = ext2_blockFromOffs(fs, group, offset);
-	free(bmp);
 
 	return EOK;
 }
@@ -314,11 +437,6 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 {
 	uint32_t *bno;
 	int err;
-
-	void *bmp = malloc(fs->blocksz);
-	if (bmp == NULL) {
-		return -ENOMEM;
-	}
 
 	uint32_t group, offset;
 	if (lbno != 0) {
@@ -333,17 +451,16 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 	uint32_t startGroup = group;
 	do {
 		if (ext2_groupHasFreeBlocks(fs, group)) {
-			err = ext2_block_read(fs, fs->gdt[group].blockBmp, bmp, 1);
+			err = ext2_block_loadBitmap(fs, group);
 			if (err < 0) {
-				free(bmp);
 				return err;
 			}
 
-			if ((offset != 0) && (ext2_checkbit(bmp, offset) == 0)) {
+			if ((offset != 0) && (ext2_checkbit(fs->balloc.bmp, offset) == 0)) {
 				break;
 			}
 			else {
-				offset = ext2_findzerobit(bmp, fs->sb->groupBlocks, offset);
+				offset = ext2_findzerobit(fs->balloc.bmp, fs->sb->groupBlocks, offset);
 			}
 		}
 		else {
@@ -353,7 +470,6 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 		if (offset == 0) {
 			group = (group + 1) % fs->groups;
 			if (group == startGroup) {
-				free(bmp);
 				return -ENOSPC;
 			}
 		}
@@ -361,54 +477,45 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 
 	uint32_t nFound;
 	for (nFound = 0; (nFound < n) && ((offset + nFound) <= fs->sb->groupBlocks); nFound++) {
-		if (ext2_checkbit(bmp, offset + nFound) != 0) {
+		if (ext2_checkbit(fs->balloc.bmp, offset + nFound) != 0) {
 			break;
 		}
-
-		err = ext2_block_get(fs, obj, block + nFound, &bno);
-		if (err < 0) {
-			free(bmp);
-			return err;
-		}
-
-		ext2_togglebit(bmp, offset + nFound);
-		*bno = ext2_blockFromOffs(fs, group, offset + nFound);
 	}
 
 	if (nFound == 0) {
-		free(bmp);
 		return -ENOSPC;
 	}
 
-	err = ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1);
-	if (err < 0) {
-		free(bmp);
-		return err;
+	/* Take the whole run before mapping it: mapping can allocate an indirect
+	 * block, from this same bitmap, and it must not be given one of these. */
+	ext2_block_take(fs, offset, nFound);
+
+	for (uint32_t i = 0; i < nFound; i++) {
+		err = ext2_block_get(fs, obj, block + i, &bno);
+		if (err < 0) {
+			/* Keep what is mapped already; give the rest back. If mapping
+			 * allocated in another group, this one has been flushed, and the
+			 * rest is released like any other block. */
+			if (ext2_block_isPending(fs, ext2_blockFromOffs(fs, group, offset + i))) {
+				ext2_block_untake(fs, offset + i, nFound - i);
+			}
+			else {
+				(void)ext2_block_destroy(fs, ext2_blockFromOffs(fs, group, offset + i), nFound - i);
+			}
+
+			if (i == 0) {
+				return err;
+			}
+
+			nFound = i;
+			break;
+		}
+
+		*bno = ext2_blockFromOffs(fs, group, offset + i);
 	}
 
-	fs->gdt[group].freeBlocks -= nFound;
-
-	err = ext2_gdt_syncone(fs, group);
-	if (err < 0) {
-		for (uint32_t j = 0; j < nFound; j++) {
-			ext2_togglebit(bmp, offset + j);
-		}
-
-		if (ext2_block_write(fs, fs->gdt[group].blockBmp, bmp, 1) == 0) {
-			fs->gdt[group].freeBlocks += nFound;
-		}
-		else {
-			fs->sb->freeBlocks -= nFound;
-		}
-
-		free(bmp);
-		return err;
-	}
-
-	fs->sb->freeBlocks -= nFound;
 	*first = ext2_blockFromOffs(fs, group, offset);
 	*res = nFound;
-	free(bmp);
 
 	return EOK;
 }
@@ -469,6 +576,12 @@ static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int de
 				return -ENOMEM;
 		}
 		else {
+			/* The block holds pointers, possibly to blocks allocated since the
+			 * last flush; they must be marked on the device first, unless this
+			 * block is itself one of them (then nothing points to it yet). */
+			if (!ext2_block_isPending(fs, obj->ind[depth].bno) && ((err = ext2_block_flush(fs)) < 0))
+				return err;
+
 			if ((err = ext2_block_write(fs, obj->ind[depth].bno, obj->ind[depth].data, 1)) < 0)
 				return err;
 		}
@@ -689,6 +802,10 @@ static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 
 	if (!ext2_blockValid(fs, bno)) {
 		return -EINVAL;
+	}
+
+	if ((err = ext2_block_releaseBitmap(fs)) < 0) {
+		return err;
 	}
 
 	group = ext2_blockToGroup(fs, bno);

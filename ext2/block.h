@@ -29,6 +29,11 @@ extern int ext2_block_read(ext2_t *fs, uint32_t bno, void *buff, uint32_t n);
 extern int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n);
 
 
+/* Writes allocations made since the last call to the device: the block bitmap,
+ * then its group descriptor. Must precede every write of a block pointer. */
+extern int ext2_block_flush(ext2_t *fs);
+
+
 /* Destroys blocks */
 extern int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n);
 

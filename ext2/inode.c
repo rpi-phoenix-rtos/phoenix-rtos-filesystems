@@ -38,6 +38,10 @@ int ext2_inode_sync(ext2_t *fs, uint32_t ino, ext2_inode_t *inode)
 	if (((fs->root != NULL) && (ino < (uint32_t)fs->root->id)) || (ino > fs->sb->inodes))
 		return -EINVAL;
 
+	/* The inode points to blocks: allocations go to the device first. */
+	if ((err = ext2_block_flush(fs)) < 0)
+		return err;
+
 	group = (ino - 1) / fs->sb->groupInodes;
 	inodes = fs->blocksz / fs->sb->inodesz;
 	bno = fs->gdt[group].inodeTbl + ((ino - 1) % fs->sb->groupInodes) / inodes;
@@ -113,6 +117,11 @@ int ext2_inode_destroy(ext2_t *fs, uint32_t ino, uint16_t mode)
 	 * mistaken caller mark the root directory available for reallocation. */
 	if ((ino < EXT2_FIRST_INO) || (ino > fs->sb->inodes))
 		return -EINVAL;
+
+	/* The group descriptor written below also carries the block counts, so
+	 * block allocations pending in the group must reach its bitmap first. */
+	if ((err = ext2_block_flush(fs)) < 0)
+		return err;
 
 	if ((bmp = malloc(fs->blocksz)) == NULL)
 		return -ENOMEM;
@@ -236,6 +245,10 @@ uint32_t ext2_inode_create(ext2_t *fs, uint32_t pino, uint16_t mode)
 		group = ext2_inode_filegroup(fs, pino);
 
 	if (group == fs->groups)
+		return 0;
+
+	/* As in ext2_inode_destroy(): the descriptor carries the block counts. */
+	if (ext2_block_flush(fs) < 0)
 		return 0;
 
 	if ((bmp = malloc(fs->blocksz)) == NULL)

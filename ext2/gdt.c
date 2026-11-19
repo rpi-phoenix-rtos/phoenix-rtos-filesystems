@@ -85,6 +85,8 @@ int ext2_gdt_sync(ext2_t *fs)
 
 void ext2_gdt_destroy(ext2_t *fs)
 {
+	(void)ext2_block_flush(fs);
+	free(fs->balloc.bmp);
 	ext2_gdt_sync(fs);
 	free(fs->gdt);
 }
@@ -124,6 +126,11 @@ int ext2_gdt_init(ext2_t *fs)
 	}
 
 	fs->groups = groups;
+	fs->balloc.bmp = NULL;
+	fs->balloc.disk = NULL;
+	fs->balloc.group = 0;
+	fs->balloc.valid = 0;
+	fs->balloc.dirty = 0;
 
 	/* The superblock's free counts are written lazily (see ext2_sb_sync()), so
 	 * after a power cut the copy on disk may be behind. The group descriptors

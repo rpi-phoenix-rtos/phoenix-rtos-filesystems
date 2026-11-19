@@ -44,10 +44,10 @@ extern int libext2_busy(void *fdata);
 extern int libext2_unmount(void *fdata);
 
 
-/* Flush to the medium: writes the superblock's free counts, the only metadata
- * ext2 does not write through, then asks the storage layer below to flush its
- * cache. Returns -ENOSYS for a filesystem mounted through the legacy callbacks,
- * which have no sync operation. */
+/* Flush to the medium: writes the metadata ext2 keeps back (pending block
+ * allocations, the superblock's free counts), then asks the storage layer below
+ * to flush its cache. Returns -ENOSYS for a filesystem mounted through the
+ * legacy callbacks, which have no sync operation. */
 extern int libext2_sync(void *fdata);
 
 

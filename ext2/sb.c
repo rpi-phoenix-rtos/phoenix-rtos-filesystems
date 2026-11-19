@@ -25,11 +25,11 @@
  * The only superblock fields this driver changes are the filesystem-wide free
  * block and inode counts, and those are a summary: each is the sum of the
  * per-group counts in the group descriptors, which are written together with
- * the bitmaps on every allocation and release. So the superblock is written
- * only on close, sync and unmount, not after every operation. Writing it after
- * every operation made it one of the six device writes each small write() cost
- * (the others are the data, the inode, the indirect block, the block bitmap
- * and its group descriptor), without making anything safer.
+ * the bitmaps. So the superblock is written only on close, sync and unmount,
+ * not after every operation. Writing it after every operation made it one of
+ * the six device writes each small write() cost (the others are the data, the
+ * inode, the indirect block, the block bitmap and its group descriptor),
+ * without making anything safer.
  *
  * After a power cut the on-disk counts may therefore be behind. That is not an
  * inconsistency anyone acts on: ext2_gdt_init() recomputes them from the

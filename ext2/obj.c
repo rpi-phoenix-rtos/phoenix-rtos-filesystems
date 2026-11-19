@@ -236,6 +236,11 @@ int _ext2_obj_sync(ext2_t *fs, ext2_obj_t *obj)
 {
 	int err;
 
+	/* The inode and the indirect blocks point to blocks, so any allocations
+	 * not yet on the device go first (see ext2_block_flush()). */
+	if ((err = ext2_block_flush(fs)) < 0)
+		return err;
+
 	if (EXT2_IS_DIRTY(obj)) {
 		if ((err = ext2_inode_sync(fs, (uint32_t)obj->id, obj->inode)) < 0)
 			return err;
