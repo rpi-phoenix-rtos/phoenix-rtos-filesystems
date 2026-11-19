@@ -143,7 +143,6 @@ int ext2_inode_destroy(ext2_t *fs, uint32_t ino, uint16_t mode)
 		}
 		else {
 			fs->sb->freeInodes++;
-			ext2_sb_sync(fs);
 		}
 
 		free(bmp);
@@ -153,7 +152,7 @@ int ext2_inode_destroy(ext2_t *fs, uint32_t ino, uint16_t mode)
 	free(bmp);
 	fs->sb->freeInodes++;
 
-	return ext2_sb_sync(fs);
+	return EOK;
 }
 
 
@@ -275,7 +274,6 @@ uint32_t ext2_inode_create(ext2_t *fs, uint32_t pino, uint16_t mode)
 		}
 		else {
 			fs->sb->freeInodes--;
-			ext2_sb_sync(fs);
 		}
 
 		free(bmp);
@@ -284,9 +282,6 @@ uint32_t ext2_inode_create(ext2_t *fs, uint32_t pino, uint16_t mode)
 
 	free(bmp);
 	fs->sb->freeInodes--;
-
-	if (ext2_sb_sync(fs) < 0)
-		return 0;
 
 	return group * fs->sb->groupInodes + ino;
 }

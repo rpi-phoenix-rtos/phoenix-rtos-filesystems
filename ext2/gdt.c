@@ -125,5 +125,17 @@ int ext2_gdt_init(ext2_t *fs)
 
 	fs->groups = groups;
 
+	/* The superblock's free counts are written lazily (see ext2_sb_sync()), so
+	 * after a power cut the copy on disk may be behind. The group descriptors
+	 * are kept exact, so take the totals from them. */
+	uint32_t freeBlocks = 0, freeInodes = 0;
+	for (uint32_t group = 0; group < groups; group++) {
+		freeBlocks += fs->gdt[group].freeBlocks;
+		freeInodes += fs->gdt[group].freeInodes;
+	}
+
+	fs->sb->freeBlocks = freeBlocks;
+	fs->sb->freeInodes = freeInodes;
+
 	return EOK;
 }

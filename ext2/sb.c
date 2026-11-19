@@ -15,15 +15,39 @@
 
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "sb.h"
 
 
+/* Writes the superblock out.
+ *
+ * The only superblock fields this driver changes are the filesystem-wide free
+ * block and inode counts, and those are a summary: each is the sum of the
+ * per-group counts in the group descriptors, which are written together with
+ * the bitmaps on every allocation and release. So the superblock is written
+ * only on close, sync and unmount, not after every operation. Writing it after
+ * every operation made it one of the six device writes each small write() cost
+ * (the others are the data, the inode, the indirect block, the block bitmap
+ * and its group descriptor), without making anything safer.
+ *
+ * After a power cut the on-disk counts may therefore be behind. That is not an
+ * inconsistency anyone acts on: ext2_gdt_init() recomputes them from the
+ * descriptors at mount, as fsck does, and fsck reports stale superblock counts
+ * without failing the check.
+ *
+ * Nothing is written when the superblock has not changed, so closing a file
+ * that was only read costs nothing. */
 int ext2_sb_sync(ext2_t *fs)
 {
 	off_t offset = SB_OFFSET;
 	void *data = fs->sb;
 	size_t size = sizeof(ext2_sb_t);
+
+	if (memcmp(fs->sb, fs->sbDisk, size) == 0) {
+		return EOK;
+	}
+
 	if (fs->strg != NULL) {
 		if (fs->strg->dev->blk->ops->write(fs->strg, fs->strg->start + offset, data, size) != size) {
 			return -EIO;
@@ -38,6 +62,8 @@ int ext2_sb_sync(ext2_t *fs)
 		return -ENOSYS;
 	}
 
+	memcpy(fs->sbDisk, fs->sb, size);
+
 	return EOK;
 }
 
@@ -46,6 +72,7 @@ void ext2_sb_destroy(ext2_t *fs)
 {
 	ext2_sb_sync(fs);
 	free(fs->sb);
+	free(fs->sbDisk);
 }
 
 
@@ -77,6 +104,13 @@ int ext2_sb_init(ext2_t *fs)
 		free(fs->sb);
 		return -ENOENT;
 	}
+
+	if ((fs->sbDisk = (ext2_sb_t *)malloc(sizeof(ext2_sb_t))) == NULL) {
+		free(fs->sb);
+		return -ENOMEM;
+	}
+
+	memcpy(fs->sbDisk, fs->sb, size);
 
 	//TODO: features check
 

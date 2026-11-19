@@ -177,7 +177,8 @@ int ext2_close(ext2_t *fs, id_t id)
 	ext2_obj_put(fs, obj);
 	ext2_obj_put(fs, obj);
 
-	return EOK;
+	/* Bring the superblock's free counts up to date (see ext2_sb_sync()). */
+	return ext2_sb_sync(fs);
 }
 
 
@@ -296,9 +297,6 @@ int ext2_truncate(ext2_t *fs, id_t id, size_t size)
 		mutexUnlock(obj->lock);
 
 		if ((err = ext2_obj_truncate(fs, obj, size)) < 0)
-			break;
-
-		if ((err = ext2_sb_sync(fs)) < 0)
 			break;
 	} while (0);
 
@@ -500,11 +498,7 @@ int ext2_setattr(ext2_t *fs, id_t id, int type, long long attr, const void *data
 			if ((err = _ext2_file_truncate(fs, obj, attr)) < 0)
 				break;
 
-			if ((err = _ext2_obj_sync(fs, obj)) < 0)
-				break;
-
-			if ((err = ext2_sb_sync(fs)) < 0)
-				break;
+			err = _ext2_obj_sync(fs, obj);
 			break;
 
 		case atMTime:

@@ -232,11 +232,6 @@ ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *bu
 		return err;
 	}
 
-	err = ext2_sb_sync(fs);
-	if (err < 0) {
-		return err;
-	}
-
 	return len;
 }
 

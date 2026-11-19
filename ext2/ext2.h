@@ -60,6 +60,7 @@ typedef struct {
 	/* Filesystem info */
 	unsigned int port; /* Filesystem port */
 	ext2_sb_t *sb;     /* SuperBlock */
+	ext2_sb_t *sbDisk; /* SuperBlock as the device has it */
 	ext2_gd_t *gdt;    /* Group Descriptors Table */
 	uint32_t blocksz;  /* Block size */
 	uint32_t groups;   /* Number of groups */

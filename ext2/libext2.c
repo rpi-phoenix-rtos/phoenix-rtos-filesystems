@@ -418,9 +418,20 @@ int libext2_handler(void *fdata, msg_t *msg)
 int libext2_sync(void *fdata)
 {
 	ext2_t *fs = (ext2_t *)fdata;
+	int err;
 
-	/* ext2 writes its metadata through on every operation, so by the time we
-	 * get here the data is in the layer BELOW us -- libcache inside the
+	/* The superblock's free counts are the one piece of metadata written
+	 * lazily (see ext2_sb_sync()); write them now. */
+	mutexLock(fs->lock);
+	err = ext2_sb_sync(fs);
+	mutexUnlock(fs->lock);
+
+	if (err < 0) {
+		return err;
+	}
+
+	/* Everything else ext2 writes through on every operation, so by the time
+	 * we get here the data is in the layer BELOW us -- libcache inside the
 	 * storage driver -- and that is what has to be flushed.
 	 *
 	 * There was no mtSync case at all, so the handler's `default: break;` left
@@ -517,6 +528,17 @@ int libext2_mount(oid_t *oid, unsigned int sectorsz, dev_read read, dev_write wr
 }
 
 
+/* libstorage sends mtSync for a file on a mounted filesystem here, i.e. fsync()
+ * and sync() on the SD root. With no .sync operation it answered -ENOSYS and
+ * flushed nothing. The whole filesystem is flushed, which covers the file. */
+static int libext2_storage_sync(void *info, oid_t *oid)
+{
+	(void)oid;
+
+	return libext2_sync(info);
+}
+
+
 const static storage_fsops_t fsOps = {
 	.open = libext2_open,
 	.close = libext2_close,
@@ -534,7 +556,7 @@ const static storage_fsops_t fsOps = {
 	.unlink = libext2_unlink,
 	.readdir = libext2_readdir,
 	.statfs = libext2_statfs,
-	.sync = NULL,
+	.sync = libext2_storage_sync,
 	.readdirNext = libext2_readdirNext,
 };
 
