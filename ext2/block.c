@@ -307,8 +307,10 @@ static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
 }
 
 
-/* Tries to allocate n consecutive blocks */
-static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t lbno, uint32_t n, uint32_t *res)
+/* Tries to allocate n consecutive blocks for logical blocks block..block + n - 1.
+ * On success *res is the number allocated (at least one) and *first the
+ * physical number of the first of them. */
+static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t lbno, uint32_t n, uint32_t *first, uint32_t *res)
 {
 	uint32_t *bno;
 	int err;
@@ -404,6 +406,7 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 	}
 
 	fs->sb->freeBlocks -= nFound;
+	*first = ext2_blockFromOffs(fs, group, offset);
 	*res = nFound;
 	free(bmp);
 
@@ -590,20 +593,26 @@ int ext2_block_syncone(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *
 
 int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff, uint32_t n)
 {
-	uint32_t lbno = 0, i = 0, j = 0, k = 0;
+	uint32_t lbno = 0, first = 0, i = 0, j = 0, k = 0;
 	uint32_t *bno;
 	int err;
 
+	/* Blocks i..j - 1 are allocated and contiguous on disk, from physical block
+	 * `first` to `lbno`, and not written yet.
+	 *
+	 * Physical numbers are kept by value. `bno` points into the cached indirect
+	 * block, and the object caches one indirect block per level, so getting a
+	 * block in another indirect block replaces it: the cached one is written
+	 * back and the other read in. Getting block i again to find where its run
+	 * starts did exactly that, and back again, whenever a run crossed from one
+	 * indirect block to the next -- several times per MiB written. */
 	while (j < n) {
 		if ((err = ext2_block_get(fs, obj, block + j, &bno)) < 0)
 			return err;
 
 		if (*bno == 0) {
 			if (i < j) {
-				if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
-					return err;
-
-				if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, j - i)) < 0)
+				if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 					return err;
 			}
 
@@ -616,7 +625,7 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 			}
 
 			for (; i < j; i += k) {
-				if ((err = ext2_block_create(fs, obj, block + i, lbno, j - i, &k)) < 0)
+				if ((err = ext2_block_create(fs, obj, block + i, lbno, j - i, &first, &k)) < 0)
 					return err;
 
 				/* ext2_block_syncone() accounts for the single-block path; this
@@ -624,24 +633,24 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 				 * ordinary buffered write ended up with i_blocks == 0. */
 				obj->inode->blocks += k * (fs->blocksz / fs->sectorsz);
 
-				if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
-					return err;
-
-				if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, k)) < 0)
+				if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, k)) < 0)
 					return err;
 			}
 
 			lbno = 0;
 		}
-		else if (lbno == 0 || (*bno == lbno + 1)) {
+		else if (lbno == 0) {
+			/* The first block of a run */
+			first = lbno = *bno;
+			j++;
+		}
+		else if (*bno == lbno + 1) {
 			lbno = *bno;
 			j++;
 		}
 		else {
 			/* This block is not contiguous with the run in progress, so it
-			 * BEGINS the next one -- remember its physical number before the
-			 * flush below overwrites *bno (which points into the indirect
-			 * block cache).
+			 * BEGINS the next one: write the run out and start a new one here.
 			 *
 			 * Setting lbno = 0 here instead left the new run's first block
 			 * unrecorded: the next iteration saw !lbno, accepted whatever
@@ -651,22 +660,16 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 			 * on top of whatever lived after the first. */
 			uint32_t cur = *bno;
 
-			if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
+			if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 				return err;
 
-			if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, j - i)) < 0)
-				return err;
-
-			lbno = cur;
+			first = lbno = cur;
 			i = j++;
 		}
 	}
 
 	if (i < j) {
-		if ((err = ext2_block_get(fs, obj, block + i, &bno)) < 0)
-			return err;
-
-		if ((err = ext2_block_write(fs, *bno, buff + i * fs->blocksz, j - i)) < 0)
+		if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 			return err;
 	}
 
