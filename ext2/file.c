@@ -138,6 +138,32 @@ ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, siz
 }
 
 
+/* Writes n bytes at offs into one block, keeping the rest of the block */
+static int _ext2_file_writePart(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t offs, const char *buff, size_t n)
+{
+	void *data = malloc(fs->blocksz);
+	if (data == NULL) {
+		return -ENOMEM;
+	}
+
+	int err = ext2_block_init(fs, obj, block, data);
+	if (err == EOK) {
+		memcpy((char *)data + offs, buff, n);
+		err = ext2_block_syncone(fs, obj, block, data);
+	}
+
+	free(data);
+
+	return err;
+}
+
+
+/* Writes what it can, front to back. When the filesystem fills up (or the
+ * device fails) part way, the bytes written up to there stay written and are
+ * accounted for as POSIX requires: the call returns their count, and the size
+ * and i_blocks match them. Only a call that wrote nothing returns the error.
+ * Out of space, it leaves the file as it was: ext2_block_create() takes back
+ * the indirect blocks it allocated for a block it found no room for. */
 ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *buff, size_t len)
 {
 	if (len == 0) {
@@ -149,77 +175,49 @@ ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *bu
 		return -EINVAL;
 	}
 
-	int err;
+	int err = EOK;
+	size_t written = 0;
 	if (S_ISLNK(obj->inode->mode) && (len <= MAX_SYMLINK_LEN_IN_INODE)) {
 		memcpy((void *)(obj->inode->block), (const void *)buff, len);
+		written = len;
 	}
 	else {
 		uint32_t block = offs / fs->blocksz;
 		uint32_t offsInBlock = offs % fs->blocksz;
-		size_t written = 0;
 
 		if ((offsInBlock != 0) || (len < fs->blocksz)) {
-			void *data = malloc(fs->blocksz);
-			if (data == NULL) {
-				return -ENOMEM;
+			size_t n = min(fs->blocksz - offsInBlock, len);
+
+			err = _ext2_file_writePart(fs, obj, block, offsInBlock, buff, n);
+			if (err == EOK) {
+				written = n;
+				block++;
 			}
-
-			err = ext2_block_init(fs, obj, block, data);
-			if (err < 0) {
-				free(data);
-				return err;
-			}
-
-			written = min(fs->blocksz - offsInBlock, len);
-			memcpy(data + offsInBlock, buff, written);
-
-			err = ext2_block_syncone(fs, obj, block, data);
-			if (err < 0) {
-				free(data);
-				return err;
-			}
-
-			free(data);
-			block++;
 		}
 
 		const uint32_t fullBlocks = (len - written) / fs->blocksz;
-		if (fullBlocks > 0) {
-			err = ext2_block_sync(fs, obj, block, buff + written, fullBlocks);
-			if (err < 0) {
-				return err;
-			}
+		if ((err == EOK) && (fullBlocks > 0)) {
+			uint32_t done;
 
-			written += fs->blocksz * fullBlocks;
-			block += fullBlocks;
+			err = ext2_block_sync(fs, obj, block, buff + written, fullBlocks, &done);
+			written += (size_t)fs->blocksz * done;
+			block += done;
 		}
 
-		if (len > written) {
-			void *data = malloc(fs->blocksz);
-			if (data == NULL) {
-				return -ENOMEM;
+		if ((err == EOK) && (len > written)) {
+			err = _ext2_file_writePart(fs, obj, block, 0, buff + written, len - written);
+			if (err == EOK) {
+				written = len;
 			}
-
-			err = ext2_block_init(fs, obj, block, data);
-			if (err < 0) {
-				free(data);
-				return err;
-			}
-
-			memcpy(data, buff + written, len - written);
-
-			err = ext2_block_syncone(fs, obj, block, data);
-			if (err < 0) {
-				free(data);
-				return err;
-			}
-
-			free(data);
 		}
 	}
 
-	if ((offs + len) > obj->inode->size) {
-		obj->inode->size = offs + len;
+	if (written == 0) {
+		return err;
+	}
+
+	if ((offs + written) > obj->inode->size) {
+		obj->inode->size = offs + written;
 	}
 
 	obj->inode->mtime = obj->inode->ctime = time(NULL);
@@ -230,7 +228,7 @@ ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *bu
 		return err;
 	}
 
-	return len;
+	return written;
 }
 
 

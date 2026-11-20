@@ -52,8 +52,9 @@ extern int ext2_block_get(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t 
 extern int ext2_block_syncone(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff);
 
 
-/* Synchronizes blocks (given object inode relative block number) */
-extern int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff, uint32_t n);
+/* Synchronizes blocks (given object inode relative block number). *written is
+ * the number of leading blocks written, also when it fails part way. */
+extern int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff, uint32_t n, uint32_t *written);
 
 
 /* Destroys inode blocks (given object inode relative block number) */

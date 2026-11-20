@@ -429,10 +429,20 @@ static int ext2_block_createone(ext2_t *fs, uint32_t ino, uint32_t *res)
 }
 
 
+static int ext2_block_prune(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n);
+
+
+/* Number of indirect blocks allocated for obj since it had `blocks` i_blocks */
+static inline uint32_t ext2_block_allocatedSince(const ext2_t *fs, const ext2_obj_t *obj, uint32_t blocks)
+{
+	return (obj->inode->blocks - blocks) / (fs->blocksz / fs->sectorsz);
+}
+
+
 /* Tries to allocate n consecutive blocks for logical blocks block..block + n - 1.
  * On success *res is the number allocated (at least one) and *first the
  * physical number of the first of them. */
-static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t lbno, uint32_t n, uint32_t *first, uint32_t *res)
+static int ext2_block_createRun(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t lbno, uint32_t n, uint32_t *first, uint32_t *res)
 {
 	uint32_t *bno;
 	int err;
@@ -490,11 +500,16 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 	ext2_block_take(fs, offset, nFound);
 
 	for (uint32_t i = 0; i < nFound; i++) {
+		uint32_t blocks = obj->inode->blocks;
+
 		err = ext2_block_get(fs, obj, block + i, &bno);
 		if (err < 0) {
-			/* Keep what is mapped already; give the rest back. If mapping
+			/* Keep what is mapped already; give the rest back, and the
+			 * indirect blocks just allocated on the way to block i. If mapping
 			 * allocated in another group, this one has been flushed, and the
 			 * rest is released like any other block. */
+			(void)ext2_block_prune(fs, obj, block + i, ext2_block_allocatedSince(fs, obj, blocks));
+
 			if (ext2_block_isPending(fs, ext2_blockFromOffs(fs, group, offset + i))) {
 				ext2_block_untake(fs, offset + i, nFound - i);
 			}
@@ -517,6 +532,33 @@ static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32
 	*res = nFound;
 
 	return EOK;
+}
+
+
+/* Allocates and maps blocks for logical blocks block..block + n - 1, as many
+ * consecutive ones as it can, but at least the first; see ext2_block_createRun().
+ *
+ * The indirect blocks on the way to the first block are allocated before the
+ * run is taken. Taken first, the run could use up the last free blocks and
+ * leave none for an indirect block the first block needs, and the file would
+ * stop growing short of a full filesystem. When there is then no room left
+ * for the data, those indirect blocks are released again: a call that fails
+ * leaves nothing allocated. */
+static int ext2_block_create(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t lbno, uint32_t n, uint32_t *first, uint32_t *res)
+{
+	uint32_t *bno, blocks = obj->inode->blocks;
+	int err;
+
+	err = ext2_block_get(fs, obj, block, &bno);
+	if (err == EOK) {
+		err = ext2_block_createRun(fs, obj, block, lbno, n, first, res);
+	}
+
+	if (err < 0) {
+		(void)ext2_block_prune(fs, obj, block, ext2_block_allocatedSince(fs, obj, blocks));
+	}
+
+	return err;
 }
 
 
@@ -729,58 +771,64 @@ int ext2_block_get(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t **res)
 
 int ext2_block_syncone(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff)
 {
-	uint32_t *bno;
+	uint32_t bno, n;
 	int err;
 
-	if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
+	if ((err = ext2_block_find(fs, obj, block, &bno)) < 0)
 		return err;
 
-	if (!(*bno)) {
-		if ((err = ext2_block_createone(fs, (uint32_t)obj->id, &block)) < 0)
+	if (bno == 0) {
+		if ((err = ext2_block_create(fs, obj, block, 0, 1, &bno, &n)) < 0)
 			return err;
 
-		*bno = block;
 		obj->inode->blocks += fs->blocksz / fs->sectorsz;
 	}
 
-	return ext2_block_write(fs, *bno, buff, 1);
+	return ext2_block_write(fs, bno, buff, 1);
 }
 
 
-int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff, uint32_t n)
+int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buff, uint32_t n, uint32_t *written)
 {
-	uint32_t lbno = 0, first = 0, i = 0, j = 0, k = 0;
-	uint32_t *bno;
+	uint32_t lbno = 0, first = 0, bno, i = 0, j = 0, k = 0;
 	int err;
 
-	/* Blocks i..j - 1 are allocated and contiguous on disk, from physical block
-	 * `first` to `lbno`, and not written yet.
+	/* Blocks 0..i - 1 are written. Blocks i..j - 1 are allocated and
+	 * contiguous on disk, from physical block `first` to `lbno`, and not
+	 * written yet. A hole is filled when the write reaches it, so a failure
+	 * (no space left) leaves blocks i.. as they were: *written = i.
 	 *
-	 * Physical numbers are kept by value. `bno` points into the cached indirect
-	 * block, and the object caches one indirect block per level, so getting a
-	 * block in another indirect block replaces it: the cached one is written
-	 * back and the other read in. Getting block i again to find where its run
-	 * starts did exactly that, and back again, whenever a run crossed from one
-	 * indirect block to the next -- several times per MiB written. */
+	 * Physical numbers are kept by value. A pointer into the cached indirect
+	 * block would not stay valid: the object caches one indirect block per
+	 * level, so looking up a block in another indirect block replaces it, the
+	 * cached one written back and the other read in. Looking block i up again
+	 * to find where its run starts did exactly that, and back again, whenever
+	 * a run crossed from one indirect block to the next -- several times per
+	 * MiB written. */
+	*written = 0;
+
 	while (j < n) {
-		if ((err = ext2_block_get(fs, obj, block + j, &bno)) < 0)
+		if ((err = ext2_block_find(fs, obj, block + j, &bno)) < 0)
 			return err;
 
-		if (*bno == 0) {
+		if (bno == 0) {
 			if (i < j) {
 				if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 					return err;
+
+				i = j;
+				*written = i;
 			}
 
-			for (i = j++; j < n; j++) {
-				if ((err = ext2_block_get(fs, obj, block + j, &bno)) < 0)
+			for (j++; j < n; j++) {
+				if ((err = ext2_block_find(fs, obj, block + j, &bno)) < 0)
 					return err;
 
-				if (*bno)
+				if (bno != 0)
 					break;
 			}
 
-			for (; i < j; i += k) {
+			while (i < j) {
 				if ((err = ext2_block_create(fs, obj, block + i, lbno, j - i, &first, &k)) < 0)
 					return err;
 
@@ -791,17 +839,20 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 
 				if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, k)) < 0)
 					return err;
+
+				i += k;
+				*written = i;
 			}
 
 			lbno = 0;
 		}
 		else if (lbno == 0) {
 			/* The first block of a run */
-			first = lbno = *bno;
+			first = lbno = bno;
 			j++;
 		}
-		else if (*bno == lbno + 1) {
-			lbno = *bno;
+		else if (bno == lbno + 1) {
+			lbno = bno;
 			j++;
 		}
 		else {
@@ -814,13 +865,12 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 			 * never compared. A run starting with two DISCONTIGUOUS blocks was
 			 * then written as if contiguous, putting the second block's data
 			 * on top of whatever lived after the first. */
-			uint32_t cur = *bno;
-
 			if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 				return err;
 
-			first = lbno = cur;
+			first = lbno = bno;
 			i = j++;
+			*written = i;
 		}
 	}
 
@@ -828,6 +878,8 @@ int ext2_block_sync(ext2_t *fs, ext2_obj_t *obj, uint32_t block, const void *buf
 		if ((err = ext2_block_write(fs, first, buff + i * fs->blocksz, j - i)) < 0)
 			return err;
 	}
+
+	*written = n;
 
 	return EOK;
 }
@@ -845,6 +897,13 @@ static int ext2_block_destroyone(ext2_t *fs, uint32_t bno)
 
 	if (!ext2_blockValid(fs, bno)) {
 		return -EINVAL;
+	}
+
+	/* Allocated since the last flush: the device has never seen it in use,
+	 * so giving it back in memory is all there is to do. */
+	if (ext2_block_isPending(fs, bno)) {
+		ext2_block_untake(fs, ext2_blockToOffs(fs, bno), 1);
+		return EOK;
 	}
 
 	if ((err = ext2_block_releaseBitmap(fs)) < 0) {
@@ -930,6 +989,63 @@ static int ext2_iblock_free(ext2_t *fs, ext2_obj_t *obj, uint32_t bno)
 			obj->ind[d].data = NULL;
 			obj->ind[d].bno = 0;
 		}
+	}
+
+	return EOK;
+}
+
+
+/* Does an indirect block map nothing? */
+static bool ext2_block_isEmpty(const ext2_t *fs, const uint32_t *ind)
+{
+	for (uint32_t i = 0; i < fs->blocksz / sizeof(uint32_t); i++) {
+		if (ind[i] != 0) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+
+/* Releases the n lowest indirect blocks on the way to `block`: ones the
+ * caller has just allocated there, and which still map nothing because no
+ * data block could be had for `block`. Only those: an empty indirect block
+ * that was there before (truncating can leave one) is referenced from the
+ * device, and releasing it here would leave that reference to a free block. */
+static int ext2_block_prune(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
+{
+	uint32_t *ind[3] = { NULL, NULL, NULL };
+	uint32_t offs[4] = { 0 };
+	int err, depth;
+
+	if ((depth = ext2_block_offs(fs, block, offs)) < 0)
+		return depth;
+
+	if ((depth == 1) || (n == 0))
+		return EOK;
+
+	if ((err = ext2_block_ind(fs, obj, depth, offs, ind, false)) < 0)
+		return err;
+
+	/* ind[level] is the indirect block at `level` above the data (0 maps the
+	 * data block), or NULL where there is none, and its own number is stored
+	 * one level up: in ind[level + 1], or in the inode for the topmost level.
+	 * The levels allocated last are the lowest ones that exist. */
+	for (int level = 0; (level < depth - 1) && (n > 0); level++) {
+		if (ind[level] == NULL)
+			continue;
+
+		if (!ext2_block_isEmpty(fs, ind[level]))
+			break;
+
+		uint32_t *parent = (level < depth - 2) ? (ind[level + 1] + offs[level + 1]) : (obj->inode->block + offs[depth - 1]);
+
+		if ((err = ext2_iblock_free(fs, obj, *parent)) < 0)
+			return err;
+
+		*parent = 0;
+		n--;
 	}
 
 	return EOK;
