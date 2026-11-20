@@ -553,6 +553,22 @@ static int ext2_block_offs(ext2_t *fs, uint32_t block, uint32_t offs[4])
 }
 
 
+/* Empties the object's cache slot for indirect blocks at `depth`.
+ *
+ * For when filling the slot has failed: by then its previous block has been
+ * written back, and a buffer left behind would be written back again later
+ * (on eviction and by _ext2_obj_sync()) -- after a failed allocation to the
+ * slot's block number, which is 0 for a slot never used, i.e. over the start
+ * of the device (the superblock, at 4 KiB blocks); after a failed read, half
+ * read contents over the previous block. */
+static void ext2_block_dropind(ext2_obj_t *obj, int depth)
+{
+	free(obj->ind[depth].data);
+	obj->ind[depth].data = NULL;
+	obj->ind[depth].bno = 0;
+}
+
+
 /* Reads an indirect block */
 static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int depth, uint32_t **ind, bool alloc)
 {
@@ -586,8 +602,10 @@ static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int de
 		}
 
 		if (!(*bno)) {
-			if ((err = ext2_block_createone(fs, (uint32_t)obj->id, &obj->ind[depth].bno)) < 0)
+			if ((err = ext2_block_createone(fs, (uint32_t)obj->id, &obj->ind[depth].bno)) < 0) {
+				ext2_block_dropind(obj, depth);
 				return err;
+			}
 
 			/* i_blocks counts a file's metadata blocks as well as its data;
 			 * e2fsck expects the indirect blocks in the total. */
@@ -597,8 +615,10 @@ static int ext2_block_readind(ext2_t *fs, ext2_obj_t *obj, uint32_t *bno, int de
 			*bno = obj->ind[depth].bno;
 		}
 		else {
-			if ((err = ext2_block_read(fs, *bno, obj->ind[depth].data, 1)) < 0)
+			if ((err = ext2_block_read(fs, *bno, obj->ind[depth].data, 1)) < 0) {
+				ext2_block_dropind(obj, depth);
 				return err;
+			}
 
 			obj->ind[depth].bno = *bno;
 		}
