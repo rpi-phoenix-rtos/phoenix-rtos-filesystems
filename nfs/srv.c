@@ -48,6 +48,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
+#include <sys/mount.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
@@ -315,6 +316,39 @@ static int wait_for_dhcp_lease(char *ip_out, size_t cap, int timeout_ms)
 }
 
 
+/* How long a mount waits for the mount table to be writable (devfs on /dev): 30 s.
+ * Any failure is retried, not only EAGAIN: the mounters of a boot all write
+ * the table at about the moment devfs is mounted. */
+#define RECORD_WAIT_TRIES 300
+#define RECORD_WAIT_US    100000
+
+
+/* Lists a mount in the mount table so that df and mount show it. Best effort.
+ * Never call it before the loop thread serves: when we are "/", writing the
+ * table looks up through us. */
+static void nfs_record(const char *source, const char *dir, const char *fstype, const char *opts)
+{
+	int i;
+
+	for (i = 0; i < RECORD_WAIT_TRIES; i++) {
+		if (mount_record(source, dir, fstype, opts) == 0) {
+			break;
+		}
+		usleep(RECORD_WAIT_US);
+	}
+}
+
+
+/* Lists this export, mounted at dir, in the mount table. */
+static void nfs_recordExport(const char *dir)
+{
+	char source[256];
+
+	(void)snprintf(source, sizeof(source), "%s:%s", common.fs.server, common.fs.export);
+	nfs_record(source, dir, "nfs", (common.fs.version == NFS_V3) ? "rw,vers=3" : "rw,vers=4");
+}
+
+
 /* Async splice (mirrors dummyfs_do_mount). Runs on its own >=64 KB stack and
  * spins until "/" is registered before sending the mtSetAttr(atDev) to the
  * parent fs. Also records the parent oid so ".." at the export root resolves. */
@@ -357,6 +391,7 @@ static void nfs_mountThread(void *arg)
 	}
 	else {
 		LOG("mounted at %s\n", mountpt);
+		nfs_recordExport(mountpt);
 	}
 
 	endthread();
@@ -685,6 +720,7 @@ static int nfs_runRoot(const char *server, const char *export, const char *verst
 	/* Run the message loop on its own >=64 KB stack (the primary stack may be
 	 * the 8 KB default). No splice thread in root mode. */
 	beginthread(nfs_loopThread, 4, common.loopStack, sizeof(common.loopStack), NULL);
+	nfs_recordExport("/");
 
 	/* Keep the NFSv4 lease alive while idle (see nfs_renewThread). */
 	beginthread(nfs_renewThread, 4, common.renewStack, sizeof(common.renewStack), NULL);
@@ -834,12 +870,21 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	 * registered but never mounted is not reliably resolvable by this late
 	 * lookup() — devfs survives only because bind;devfs;/dev references it. */
 	oid_t tmpfsOid;
-	if ((lookup("/ramtmp", NULL, &tmpfsOid) == 0) || (lookup("tmpfs", NULL, &tmpfsOid) == 0)) {
+	const char *tmpfsSource = NULL;
+	int tmpfsBound = 0;
+	if (lookup("/ramtmp", NULL, &tmpfsOid) == 0) {
+		tmpfsSource = "/ramtmp";
+	}
+	else if (lookup("tmpfs", NULL, &tmpfsOid) == 0) {
+		tmpfsSource = "tmpfs";
+	}
+	if (tmpfsSource != NULL) {
 		(void)nfs_mkdir2(common.fs.nfs, "/tmp", 01777);
 		nfs_node_t *tmpNode = nfs_node_get(&common.fs.nodes, "/tmp");
 		if (tmpNode != NULL) {
 			tmpNode->type = otDir;
 			tmpNode->mnt = tmpfsOid;
+			tmpfsBound = 1;
 			LOG("re-bound /tmp (takeover, tmpfs port=%u)\n", tmpfsOid.port);
 		}
 		else {
@@ -942,6 +987,13 @@ static int nfs_runTakeover(const char *server, const char *export, const char *v
 	}
 
 	LOG("registered / (takeover)\n");
+
+	/* The /dev and /ramtmp re-binds keep the devfs and tmpfs mounts listed
+	 * before the takeover; /tmp is new. */
+	nfs_recordExport("/");
+	if (tmpfsBound != 0) {
+		nfs_record(tmpfsSource, "/tmp", "bind", "rw");
+	}
 
 	/* The loop thread serves "/" forever; park the main thread. */
 	for (;;) {
