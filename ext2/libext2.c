@@ -122,14 +122,18 @@ static int libext2_create(void *info, oid_t *dir, const char *name, oid_t *oid, 
 	if (ret >= 0 && type == otSymlink) {
 		const char *target = name + namelen + 1;
 		size_t targetlen = strlen(target);
-		int retWrite;
+		ssize_t retWrite;
 
 		/* not writing trailing '\0', readlink() does not append it */
 		offs = 0;
 		retWrite = ext2_write(fs, oid->id, &offs, target, targetlen, 0);
-		if (retWrite < 0) {
-			ret = retWrite;
-			ext2_destroy(fs, oid->id);
+		if (retWrite != (ssize_t)targetlen) {
+			/* A symlink holds its whole target or does not exist. A short
+			 * write means the filesystem is full. Unlinking removes the
+			 * directory entry as well as the inode; destroying the inode
+			 * alone left the entry behind, pointing to a freed inode. */
+			ret = (retWrite < 0) ? (int)retWrite : -ENOSPC;
+			(void)ext2_unlink(fs, dir->id, name, namelen);
 			oid->id = 0;
 		}
 	}
