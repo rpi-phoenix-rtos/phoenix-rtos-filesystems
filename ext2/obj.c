@@ -241,12 +241,11 @@ int _ext2_obj_sync(ext2_t *fs, ext2_obj_t *obj)
 	if ((err = ext2_block_flush(fs)) < 0)
 		return err;
 
-	if (EXT2_IS_DIRTY(obj)) {
-		if ((err = ext2_inode_sync(fs, (uint32_t)obj->id, obj->inode)) < 0)
-			return err;
-
-		obj->flags &= ~OFLAG_DIRTY;
-	}
+	/* Then each indirect block before what points to it: the single before
+	 * the double, the double before the triple, all of them before the inode.
+	 * A newly allocated indirect block still holds whatever its last owner
+	 * wrote there, so written the other way round, a power cut between the
+	 * two writes left a pointer to a block of garbage "block numbers". */
 	if (!EXT2_ISDEV(obj->inode->mode) && !EXT2_IS_MOUNTPOINT(obj)) {
 		if ((obj->ind[0].data != NULL) && (err = ext2_block_write(fs, obj->ind[0].bno, obj->ind[0].data, 1)) < 0)
 			return err;
@@ -256,6 +255,13 @@ int _ext2_obj_sync(ext2_t *fs, ext2_obj_t *obj)
 
 		if ((obj->ind[2].data != NULL) && (err = ext2_block_write(fs, obj->ind[2].bno, obj->ind[2].data, 1)) < 0)
 			return err;
+	}
+
+	if (EXT2_IS_DIRTY(obj)) {
+		if ((err = ext2_inode_sync(fs, (uint32_t)obj->id, obj->inode)) < 0)
+			return err;
+
+		obj->flags &= ~OFLAG_DIRTY;
 	}
 
 	return EOK;
