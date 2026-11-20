@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/msg.h>
 #include <sys/stat.h>
 #include <sys/threads.h>
@@ -154,13 +155,62 @@ static void dummyfs_waitMountpt(const char *mountpt)
 }
 
 
-static char __attribute__((aligned(8))) mtstack[4096];
+/* How long a mount waits for the mount table to be writable (devfs mounted
+ * on /dev, done by the boot script after the root is up): 300 x 100 ms = 30 s.
+ * Any failure is retried, not only EAGAIN: the mounters of a boot all write
+ * the table at about the moment devfs is mounted. */
+#define RECORD_WAIT_TRIES 300
+#define RECORD_WAIT_US    100000
+
+
+/*
+ * Lists the mount in the mount table so that df and mount show it. Must not run
+ * on the thread serving this filesystem: writing the table may need a lookup
+ * through it (always so when it is "/"). Best effort, it never fails the mount.
+ */
+static void dummyfs_record(dummyfs_t *ctx)
+{
+	const char *dir = (ctx->mountpt != NULL) ? ctx->mountpt : "/";
+	char *abspath = resolve_path(dir, NULL, 1, 0);
+	oid_t root;
+	int i;
+
+	if (abspath == NULL) {
+		return;
+	}
+
+	for (i = 0; i < RECORD_WAIT_TRIES; i++) {
+		/* A root that has been taken over by another filesystem is not mounted any more. */
+		if ((ctx->mountpt == NULL) && ((lookup("/", NULL, &root) < 0) || (root.port != ctx->port))) {
+			break;
+		}
+		if (mount_record("dummyfs", abspath, "dummyfs", "rw") == 0) {
+			break;
+		}
+		usleep(RECORD_WAIT_US);
+	}
+
+	free(abspath);
+}
+
+
+/* For the thread that mounts (-m) or, when mounted already, records (-D, "/") */
+static char __attribute__((aligned(8))) mtstack[8192];
 
 void dummyfs_mount_async(void *arg)
 {
 	dummyfs_t *ctx = (dummyfs_t *)arg;
 
-	dummyfs_mount_sync(ctx, ctx->mountpt);
+	if (dummyfs_mount_sync(ctx, ctx->mountpt) == 0) {
+		dummyfs_record(ctx);
+	}
+	endthread();
+}
+
+
+static void dummyfs_recordThread(void *arg)
+{
+	dummyfs_record((dummyfs_t *)arg);
 	endthread();
 }
 
@@ -309,12 +359,26 @@ int main(int argc, char **argv)
 
 		/* init completed - wake parent */
 		kill(getppid(), SIGUSR1);
+
+		if (!non_fs_namespace) {
+			/* set by dummyfs_mount() for -m, not for -r */
+			if (ctx->mountpt == NULL) {
+				ctx->mountpt = strdup(mountpt);
+			}
+			if (ctx->mountpt != NULL) {
+				beginthread(dummyfs_recordThread, 4, &mtstack, sizeof(mtstack), (void *)ctx);
+			}
+		}
 	}
 	else if (mountpt != NULL) {
 		ctx->mountpt = strdup(mountpt);
 		if (ctx->mountpt == NULL)
 			return 1;
 		beginthread(dummyfs_mount_async, 4, &mtstack, sizeof(mtstack), (void *)ctx);
+	}
+	else if (!non_fs_namespace) {
+		/* "/" */
+		beginthread(dummyfs_recordThread, 4, &mtstack, sizeof(mtstack), (void *)ctx);
 	}
 
 	/*** MAIN LOOP ***/
