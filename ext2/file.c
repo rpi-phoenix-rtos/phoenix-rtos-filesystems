@@ -72,7 +72,7 @@ ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, siz
 
 	/* Read CONTIGUOUS physical runs in one call instead of one call per block.
 	 * ext2_block_sync() has always coalesced runs on the write side; the read
-	 * side did not, so a sequential read paid an ext2_block_get() plus a
+	 * side did not, so a sequential read paid an ext2_block_find() plus a
 	 * separate single-block ext2_block_read() for every 4 KiB. That per-block
 	 * cost does not overlap the device transfer: a 64 KiB cache line fetched at
 	 * the raw 59.1 MB/s takes 1.109 ms and serves 16 blocks, i.e. 69.3 us of
@@ -80,22 +80,20 @@ ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, siz
 	 * difference is exactly the 42.6-vs-59.1 MB/s gap. */
 	blkEnd = (offs + len) / fs->blocksz;
 	while (block < blkEnd) {
-		uint32_t *bno, first, n;
+		uint32_t bno, first, n;
 
-		if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
+		if ((err = ext2_block_find(fs, obj, block, &bno)) < 0)
 			return err;
 
 		/* A hole reads as zeros; it has no physical run to coalesce. */
-		if (*bno == 0) {
+		if (bno == 0) {
 			memset(buff + l, 0, fs->blocksz);
 			block++;
 			l += fs->blocksz;
 			continue;
 		}
 
-		/* Take the value now: a later ext2_block_get() may reload the indirect
-		 * block this pointer refers into. */
-		first = *bno;
+		first = bno;
 
 		/* Cap the run. Before coalescing, this path never asked the storage
 		 * layer for more than ONE block, so an unbounded run hands a driver a
@@ -105,10 +103,10 @@ ssize_t _ext2_file_read(ext2_t *fs, ext2_obj_t *obj, off_t offs, char *buff, siz
 		 * the whole benefit anyway: it matches the block cache's line, so a
 		 * longer run cannot save another fetch. */
 		for (n = 1; ((block + n) < blkEnd) && ((n + 1u) <= runMax); n++) {
-			if ((err = ext2_block_get(fs, obj, block + n, &bno)) < 0)
+			if ((err = ext2_block_find(fs, obj, block + n, &bno)) < 0)
 				return err;
 
-			if (*bno != (first + n))
+			if (bno != (first + n))
 				break;
 		}
 
@@ -238,7 +236,7 @@ ssize_t _ext2_file_write(ext2_t *fs, ext2_obj_t *obj, off_t offs, const char *bu
 
 int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 {
-	uint32_t *bno, block, first = 0, run = 0, freed = 0;
+	uint32_t bno, block, first = 0, run = 0, freed = 0;
 	uint32_t start = (size + fs->blocksz - 1) / fs->blocksz;
 	uint32_t end = (obj->inode->size + fs->blocksz - 1) / fs->blocksz;
 	int err;
@@ -258,7 +256,7 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 	if (obj->inode->size > size) {
 		/* Release contiguous runs of ALLOCATED blocks in one call each.
 		 *
-		 * A hole (*bno == 0) owns no storage, so it must break the run rather
+		 * A hole (bno == 0) owns no storage, so it must break the run rather
 		 * than extend it. The previous form tracked the last block number and
 		 * tested `!lbno || (*bno == lbno + 1)`, which treated a hole as
 		 * contiguous -- a hole set lbno = 0, and the next iteration's !lbno
@@ -269,10 +267,10 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 		 * the end of fs->gdt[]; and where it did not fault it freed blocks
 		 * that had never been allocated, destroying whatever file owned them. */
 		for (block = start; block < end; block++) {
-			if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
+			if ((err = ext2_block_find(fs, obj, block, &bno)) < 0)
 				return err;
 
-			if (*bno == 0) {
+			if (bno == 0) {
 				if (run > 0) {
 					if ((err = ext2_block_destroy(fs, first, run)) < 0)
 						return err;
@@ -284,10 +282,10 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 			}
 
 			if (run == 0) {
-				first = *bno;
+				first = bno;
 				run = 1;
 			}
-			else if (*bno == (first + run)) {
+			else if (bno == (first + run)) {
 				run++;
 			}
 			else {
@@ -295,7 +293,7 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 					return err;
 
 				freed += run;
-				first = *bno;
+				first = bno;
 				run = 1;
 			}
 		}
@@ -328,13 +326,13 @@ int _ext2_file_truncate(ext2_t *fs, ext2_obj_t *obj, size_t size)
 		 * POSIX requires that gap to read as zeros. */
 		if ((size % fs->blocksz) != 0) {
 			uint32_t last = size / fs->blocksz;
-			uint32_t *lbno;
+			uint32_t lbno;
 
-			if ((err = ext2_block_get(fs, obj, last, &lbno)) < 0)
+			if ((err = ext2_block_find(fs, obj, last, &lbno)) < 0)
 				return err;
 
 			/* A hole already reads as zeros and owns nothing to clear. */
-			if (*lbno != 0) {
+			if (lbno != 0) {
 				void *data = malloc(fs->blocksz);
 				if (data == NULL)
 					return -ENOMEM;

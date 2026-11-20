@@ -38,7 +38,13 @@ extern int ext2_block_flush(ext2_t *fs);
 extern int ext2_block_destroy(ext2_t *fs, uint32_t bno, uint32_t n);
 
 
-/* Calculates physical block number (given object inode relative block number) */
+/* Finds the physical block number of an object's block (0 for a hole), without allocating anything */
+extern int ext2_block_find(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t *res);
+
+
+/* Returns where the physical block number of an object's block is stored,
+ * allocating the indirect blocks on the way to it. Writers only: use
+ * ext2_block_find() to look a block up. */
 extern int ext2_block_get(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t **res);
 
 

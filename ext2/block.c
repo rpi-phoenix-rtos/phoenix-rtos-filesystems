@@ -146,9 +146,8 @@ int ext2_block_write(ext2_t *fs, uint32_t bno, const void *buff, uint32_t n)
  *
  * Allocations can stay pending after an operation returns, but only ones that
  * nothing on the device refers to: a write() writes its inode, which flushes
- * them, while reading a hole (which allocates its indirect blocks) or a write
- * that fails part way may not. Releasing blocks, allocating or releasing an
- * inode, sync and unmount flush them too. */
+ * them, while a write that fails part way may not. Releasing blocks,
+ * allocating or releasing an inode, sync and unmount flush them too. */
 
 
 /* Writes the allocations made since the last flush to the device */
@@ -661,6 +660,30 @@ static int ext2_block_ind(ext2_t *fs, ext2_obj_t *obj, int depth, uint32_t offs[
 }
 
 
+int ext2_block_find(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t *res)
+{
+	uint32_t *ind[3] = { NULL, NULL, NULL };
+	uint32_t offs[4] = { 0 };
+	int err, depth;
+
+	if ((depth = ext2_block_offs(fs, block, offs)) < 0)
+		return depth;
+
+	if (depth == 1) {
+		*res = obj->inode->block[offs[0]];
+		return EOK;
+	}
+
+	/* Without allocating: a missing indirect block means a hole. */
+	if ((err = ext2_block_ind(fs, obj, depth, offs, ind, false)) < 0)
+		return err;
+
+	*res = (ind[0] != NULL) ? ind[0][offs[0]] : 0;
+
+	return EOK;
+}
+
+
 int ext2_block_get(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t **res)
 {
 	uint32_t *ind[3] = { NULL, NULL, NULL };
@@ -986,23 +1009,23 @@ int ext2_iblock_destroy(ext2_t *fs, ext2_obj_t *obj, uint32_t block, uint32_t n)
 
 int ext2_block_init(ext2_t *fs, ext2_obj_t *obj, uint32_t block, void *buff)
 {
-	uint32_t *bno;
+	uint32_t bno;
 	int err;
 
-	if ((err = ext2_block_get(fs, obj, block, &bno)) < 0)
+	if ((err = ext2_block_find(fs, obj, block, &bno)) < 0)
 		return err;
 
 	/* An unallocated block is a HOLE, and a hole reads as zeros. Passing
-	 * *bno == 0 to ext2_block_read() instead read block 0 OF THE DEVICE -- the
+	 * bno == 0 to ext2_block_read() instead read block 0 OF THE DEVICE -- the
 	 * boot sector and superblock -- so reading a sparse file's hole returned
 	 * superblock bytes where POSIX requires zeros, and every freshly created
 	 * file's first block began life as a copy of block 0 with only the written
 	 * bytes laid over it. Those stale bytes become visible as soon as the file
 	 * is extended. */
-	if (*bno == 0) {
+	if (bno == 0) {
 		memset(buff, 0, fs->blocksz);
 		return EOK;
 	}
 
-	return ext2_block_read(fs, *bno, buff, 1);
+	return ext2_block_read(fs, bno, buff, 1);
 }
